@@ -10,6 +10,11 @@
 const build_config = @import("build_config.zig");
 
 const cursor = @import("renderer/cursor.zig");
+// The animation state machine behind `cursor-motion`. The renderer uses it
+// via `renderer/generic.zig`; this import is here to pull its tests into
+// the test graph.
+const cursor_motion = @import("renderer/cursor_motion.zig");
+const input_motion = @import("renderer/input_motion.zig");
 const message = @import("renderer/message.zig");
 const size = @import("renderer/size.zig");
 pub const shadertoy = @import("renderer/shadertoy.zig");
@@ -58,6 +63,8 @@ test {
     _ = Renderer;
 
     _ = cursor;
+    _ = cursor_motion;
+    _ = input_motion;
     _ = message;
     _ = shadertoy;
     _ = size;

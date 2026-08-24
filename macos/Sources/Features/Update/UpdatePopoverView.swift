@@ -59,7 +59,7 @@ private struct PermissionRequestView: View {
                 Text("Enable automatic updates?")
                     .font(.system(size: 13, weight: .semibold))
 
-                Text("Ghostty can automatically check for updates in the background.")
+                Text("Ghosttal's automatic update channel is not enabled yet.")
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

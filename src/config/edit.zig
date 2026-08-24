@@ -8,10 +8,9 @@ const global = @import("../global.zig");
 
 /// The path to the configuration that should be opened for editing.
 ///
-/// On Linux, this will use the file at the XDG config path. This is the
-/// only valid path for Linux so we don't need to check for other paths.
+/// On Linux, this uses Ghosttal's XDG overlay path.
 ///
-/// On macOS, both XDG and AppSupport paths are valid. Because Ghostty
+/// On macOS, both Ghosttal XDG and AppSupport overlay paths are valid. Because Ghosttal
 /// prioritizes AppSupport over XDG, we will use AppSupport if it exists,
 /// followed by XDG if it exists, and finally AppSupport if neither exist.
 /// For the existence check, we also prefer non-empty files over empty
@@ -129,8 +128,8 @@ fn configPathCandidates(alloc_arena: Allocator) ![]const []const u8 {
         paths.appendAssumeCapacity(try file_load.legacyDefaultAppSupportPath(alloc_arena));
     }
 
-    paths.appendAssumeCapacity(try file_load.defaultXdgPath(alloc_arena));
-    paths.appendAssumeCapacity(try file_load.legacyDefaultXdgPath(alloc_arena));
+    paths.appendAssumeCapacity(try file_load.ghosttalDefaultXdgPath(alloc_arena));
+    paths.appendAssumeCapacity(try file_load.ghosttalLegacyDefaultXdgPath(alloc_arena));
 
     return paths.items;
 }

@@ -897,6 +897,56 @@ palette: Palette = .{},
 ///   * `false`
 @"cursor-style-blink": ?bool = null,
 
+/// Animate the cursor gliding between cells instead of jumping instantly
+/// to its new position. This can make the cursor easier to track visually
+/// as it moves around the terminal.
+///
+/// Valid values are:
+///
+///   * `none` - No animation. The cursor jumps immediately to its new
+///     position and matches the previous behavior of Ghostty.
+///   * `ease` - The cursor eases (accelerates and decelerates) to its new
+///     position.
+///   * `spring` - The cursor moves to its new position with a springy,
+///     slightly overshooting motion.
+///   * `smear` - The cursor stretches towards its new position and then
+///     contracts back to its normal size, similar to a motion blur effect.
+///   * `squash` - The cursor squashes in the direction of motion before
+///     settling into its new position.
+///
+/// The default is `smear`. On macOS, Reduce Motion disables this effect by
+/// default; set `cursor-motion-respect-reduce-motion = false` to override it.
+///
+/// This can be changed at runtime and will affect all open terminals.
+@"cursor-motion": CursorMotion = .smear,
+
+/// The duration, in milliseconds, of the cursor motion animation set by
+/// `cursor-motion`. This value is ignored if `cursor-motion` is `none`.
+///
+/// The value is clamped to the range `0` to `1000` milliseconds.
+///
+/// This can be changed at runtime and will affect all open terminals.
+@"cursor-motion-duration": u32 = 150,
+
+/// Follow the macOS Reduce Motion accessibility preference for cursor motion.
+@"cursor-motion-respect-reduce-motion": bool = true,
+
+/// Animate a confirmed, locally echoed text glyph as it arrives. This never
+/// animates paste, IME preedit, or arbitrary PTY output.
+///
+/// This can be changed at runtime and follows macOS Reduce Motion by default.
+@"input-motion": bool = true,
+
+/// Duration in milliseconds for `input-motion`, clamped to 0–1000.
+@"input-motion-duration": u32 = 150,
+
+/// Overall strength of `input-motion`, clamped to 0–1. This scales the rise
+/// distance and opacity; zero leaves input completely static.
+@"input-motion-intensity": f64 = 1,
+
+/// Follow the macOS Reduce Motion accessibility preference for input motion.
+@"input-motion-respect-reduce-motion": bool = true,
+
 /// The color of the text under the cursor. If this is not set, a default will
 /// be chosen.
 /// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
@@ -4123,84 +4173,84 @@ fn writeConfigTemplate(path: []const u8) !void {
     try writer.flush();
 }
 
-/// Load configurations from the default configuration files. The default
-/// configuration file is at `$XDG_CONFIG_HOME/ghostty/config.ghostty`.
+/// Load stock Ghostty configuration as a base, then apply Ghosttal's optional
+/// configuration as an overlay. Within each directory, the legacy `config`
+/// file is loaded before `config.ghostty`.
 ///
-/// On macOS, `$HOME/Library/Application Support/$CFBundleIdentifier/`
-/// is also loaded.
-///
-/// The legacy `config` file (without extension) is first loaded,
-/// then `config.ghostty`.
+/// This lets an existing Ghostty setup work unchanged while keeping
+/// Ghosttal-only motion preferences out of Ghostty's own configuration.
 pub fn loadDefaultFiles(self: *Config, alloc: Allocator) !void {
-    // Load XDG first
+    var any_loaded = false;
+
+    // Ghostty's XDG config is the first base layer on every platform.
     const legacy_xdg_path = try file_load.legacyDefaultXdgPath(alloc);
     defer alloc.free(legacy_xdg_path);
     const xdg_path = try file_load.defaultXdgPath(alloc);
     defer alloc.free(xdg_path);
-    const xdg_loaded: bool = xdg_loaded: {
-        const legacy_xdg_action = self.loadOptionalFile(alloc, legacy_xdg_path);
-        const xdg_action = self.loadOptionalFile(alloc, xdg_path);
-        if (xdg_action != .not_found and legacy_xdg_action != .not_found) {
-            log.warn("both config files `{s}` and `{s}` exist.", .{ legacy_xdg_path, xdg_path });
-            log.warn("loading them both in that order", .{});
-            break :xdg_loaded true;
-        }
+    any_loaded = self.loadDefaultFilePair(alloc, legacy_xdg_path, xdg_path) or any_loaded;
 
-        break :xdg_loaded xdg_action != .not_found or
-            legacy_xdg_action != .not_found;
-    };
-
-    // On macOS load the app support directory as well
+    // On macOS, inherit Ghostty's Application Support config as another base
+    // layer. This remains explicit even though Ghosttal has its own bundle ID.
     if (comptime builtin.os.tag == .macos) {
-        const legacy_app_support_path = try file_load.legacyDefaultAppSupportPath(alloc);
-        defer alloc.free(legacy_app_support_path);
-        const app_support_path = try file_load.preferredAppSupportPath(alloc);
-        defer alloc.free(app_support_path);
-        const app_support_loaded: bool = loaded: {
-            const legacy_app_support_action = self.loadOptionalFile(
-                alloc,
-                legacy_app_support_path,
-            );
-
-            // The app support path and legacy may be the same, since we
-            // use the `preferred` call above. If its the same, avoid
-            // a double-load.
-            const app_support_action: OptionalFileAction = if (!std.mem.eql(
-                u8,
-                legacy_app_support_path,
-                app_support_path,
-            )) self.loadOptionalFile(
-                alloc,
-                app_support_path,
-            ) else .not_found;
-
-            if (app_support_action != .not_found and legacy_app_support_action != .not_found) {
-                log.warn(
-                    "both config files `{s}` and `{s}` exist.",
-                    .{ legacy_app_support_path, app_support_path },
-                );
-                log.warn("loading them both in that order", .{});
-                break :loaded true;
-            }
-
-            break :loaded app_support_action != .not_found or
-                legacy_app_support_action != .not_found;
-        };
-
-        // If both files are not found, then we create a template file.
-        // For macOS, we only create the template file in the app support
-        if (!app_support_loaded and !xdg_loaded) {
-            writeConfigTemplate(app_support_path) catch |err| {
-                log.warn("error creating template config file err={}", .{err});
-            };
-        }
-    } else {
-        if (!xdg_loaded) {
-            writeConfigTemplate(xdg_path) catch |err| {
-                log.warn("error creating template config file err={}", .{err});
-            };
-        }
+        const ghostty_legacy_app_support = try file_load.ghosttyLegacyDefaultAppSupportPath(alloc);
+        defer alloc.free(ghostty_legacy_app_support);
+        const ghostty_app_support = try file_load.ghosttyDefaultAppSupportPath(alloc);
+        defer alloc.free(ghostty_app_support);
+        any_loaded = self.loadDefaultFilePair(
+            alloc,
+            ghostty_legacy_app_support,
+            ghostty_app_support,
+        ) or any_loaded;
     }
+
+    // Ghosttal's XDG config overlays every stock Ghostty config.
+    const ghosttal_legacy_xdg = try file_load.ghosttalLegacyDefaultXdgPath(alloc);
+    defer alloc.free(ghosttal_legacy_xdg);
+    const ghosttal_xdg = try file_load.ghosttalDefaultXdgPath(alloc);
+    defer alloc.free(ghosttal_xdg);
+    any_loaded = self.loadDefaultFilePair(
+        alloc,
+        ghosttal_legacy_xdg,
+        ghosttal_xdg,
+    ) or any_loaded;
+
+    if (comptime builtin.os.tag == .macos) {
+        // The Ghosttal Application Support config is the final, highest-priority
+        // default layer on macOS.
+        const ghosttal_legacy_app_support = try file_load.legacyDefaultAppSupportPath(alloc);
+        defer alloc.free(ghosttal_legacy_app_support);
+        const ghosttal_app_support = try file_load.defaultAppSupportPath(alloc);
+        defer alloc.free(ghosttal_app_support);
+        any_loaded = self.loadDefaultFilePair(
+            alloc,
+            ghosttal_legacy_app_support,
+            ghosttal_app_support,
+        ) or any_loaded;
+
+        if (!any_loaded) writeConfigTemplate(ghosttal_app_support) catch |err| {
+            log.warn("error creating Ghosttal template config file err={}", .{err});
+        };
+    } else if (!any_loaded) {
+        writeConfigTemplate(ghosttal_xdg) catch |err| {
+            log.warn("error creating Ghosttal template config file err={}", .{err});
+        };
+    }
+}
+
+fn loadDefaultFilePair(
+    self: *Config,
+    alloc: Allocator,
+    legacy_path: []const u8,
+    path: []const u8,
+) bool {
+    const legacy_action = self.loadOptionalFile(alloc, legacy_path);
+    const action = self.loadOptionalFile(alloc, path);
+    if (action != .not_found and legacy_action != .not_found) {
+        log.warn("both config files `{s}` and `{s}` exist.", .{ legacy_path, path });
+        log.warn("loading them both in that order", .{});
+    }
+
+    return action != .not_found or legacy_action != .not_found;
 }
 
 /// Load and parse the CLI args.
@@ -5383,6 +5433,16 @@ pub const CustomShaderAnimation = enum(c_int) {
     false,
     true,
     always,
+};
+
+/// Valid values for cursor-motion
+/// c_int keeps this stable for generated config metadata.
+pub const CursorMotion = enum(c_int) {
+    none,
+    ease,
+    spring,
+    smear,
+    squash,
 };
 
 /// Valid values for macos-non-native-fullscreen
@@ -10973,6 +11033,34 @@ test "theme specifying light/dark sets theme usage in conditional state" {
         try testing.expect(cfg.@"window-theme" == .system);
         try testing.expect(cfg._conditional_set.contains(.theme));
     }
+}
+
+test "cursor-motion parses" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    try testing.expectEqual(CursorMotion.smear, cfg.@"cursor-motion");
+    try testing.expectEqual(@as(u32, 150), cfg.@"cursor-motion-duration");
+    try testing.expect(cfg.@"input-motion");
+    try testing.expectEqual(@as(u32, 150), cfg.@"input-motion-duration");
+    try testing.expectEqual(@as(f64, 1), cfg.@"input-motion-intensity");
+
+    var it: TestIterator = .{ .data = &.{
+        "--cursor-motion=spring",
+        "--cursor-motion-duration=250",
+        "--input-motion=false",
+        "--input-motion-duration=80",
+        "--input-motion-intensity=0.4",
+    } };
+    try cfg.loadIter(alloc, &it);
+
+    try testing.expectEqual(CursorMotion.spring, cfg.@"cursor-motion");
+    try testing.expectEqual(@as(u32, 250), cfg.@"cursor-motion-duration");
+    try testing.expect(!cfg.@"input-motion");
+    try testing.expectEqual(@as(u32, 80), cfg.@"input-motion-duration");
+    try testing.expectEqual(@as(f64, 0.4), cfg.@"input-motion-intensity");
 }
 
 test "scrollback limits" {

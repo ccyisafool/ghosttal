@@ -9,6 +9,7 @@ const Inspector = @import("../inspector/main.zig").Inspector;
 const terminalpkg = @import("../terminal/main.zig");
 const inputpkg = @import("../input.zig");
 const renderer = @import("../renderer.zig");
+const inputmotion = @import("input_motion.zig");
 
 /// The mutex that must be held while reading any of the data in the
 /// members of this state. Note that the state itself is NOT protected
@@ -28,6 +29,10 @@ inspector: ?*Inspector = null,
 /// Preedit can in theory be multiple codepoints long but that is left as
 /// a future exercise.
 preedit: ?Preedit = null,
+
+/// Locally encoded key intent awaiting a matching terminal snapshot. This is
+/// protected by `mutex`; arbitrary PTY output cannot create entries here.
+input_motion: inputmotion.Queue = .{},
 
 /// Mouse state. This only contains state relevant to what renderers
 /// need about the mouse.

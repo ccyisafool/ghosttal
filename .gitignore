@@ -32,3 +32,13 @@ glad.zip
 vgcore.*
 
 /sprite_face_test*
+
+# Signing credentials must never enter the repository.
+*.key
+*.csr
+*.p12
+*.p8
+*.cer
+
+# Local signed release artifacts are published separately.
+/dist/*.dmg

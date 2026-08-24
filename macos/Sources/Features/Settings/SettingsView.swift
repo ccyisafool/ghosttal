@@ -12,9 +12,9 @@ struct SettingsView: View {
                 .frame(width: 128, height: 128)
 
             VStack(alignment: .leading) {
-                Text("Coming Soon. 🚧").font(.title)
-                Text("You can't configure settings in the GUI yet. To modify settings, " +
-                     "edit the file at $HOME/.config/ghostty/config.ghostty and restart Ghostty.")
+                Text("Configuration").font(.title)
+                Text("Ghosttal reads your Ghostty config first, then applies its own overlay. " +
+                     "Use Open Configuration to edit Ghosttal-only motion settings, then reload.")
                 .multilineTextAlignment(.leading)
                 .lineLimit(nil)
             }

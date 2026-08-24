@@ -116,11 +116,15 @@ flags: packed struct {
 
 pub const DerivedConfig = struct {
     custom_shader_animation: configpkg.CustomShaderAnimation,
+    cursor_motion: configpkg.CursorMotion,
+    cursor_motion_duration: u32,
     scrollback_compression: bool,
 
     pub fn init(config: *const configpkg.Config) DerivedConfig {
         return .{
             .custom_shader_animation = config.@"custom-shader-animation",
+            .cursor_motion = config.@"cursor-motion",
+            .cursor_motion_duration = @min(1000, config.@"cursor-motion-duration"),
             .scrollback_compression = config.@"scrollback-compression",
         };
     }
@@ -309,24 +313,43 @@ fn setQosClass(self: *const Thread) void {
     }
 }
 
-fn syncDrawTimer(self: *Thread) void {
-    skip: {
-        // If our renderer supports animations and has them, then we
-        // can apply draw timer based on custom shader animation configuration.
-        if (@hasDecl(rendererpkg.Renderer, "hasAnimations") and
-            self.renderer.hasAnimations())
-        {
-            // If our config says to always animate, we do so.
-            switch (self.config.custom_shader_animation) {
-                // Always animate
-                .always => break :skip,
-                // Only when focused
-                .true => if (self.flags.focused) break :skip,
-                // Never animate
-                .false => {},
-            }
-        }
+/// Whether the high frequency draw timer should be running right now.
+fn drawTimerNeeded(self: *const Thread) bool {
+    // Cursor motion animates on its own schedule and is deliberately NOT
+    // gated by `custom-shader-animation`, which governs custom shaders
+    // only. We do pump only while focused, matching the cursor blink timer
+    // which is also stopped on focus loss; the renderer snaps the cursor on
+    // any focus change, so there's never a half-finished animation left
+    // frozen on screen.
+    if (@hasDecl(rendererpkg.Renderer, "cursorMotionActive") and
+        self.flags.focused and
+        self.renderer.cursorMotionActive()) return true;
 
+    if (@hasDecl(rendererpkg.Renderer, "inputMotionActive") and
+        self.flags.focused and
+        self.renderer.inputMotionActive()) return true;
+
+    // If our renderer supports animations and has them, then we
+    // can apply draw timer based on custom shader animation configuration.
+    if (@hasDecl(rendererpkg.Renderer, "hasAnimations") and
+        self.renderer.hasAnimations())
+    {
+        // If our config says to always animate, we do so.
+        switch (self.config.custom_shader_animation) {
+            // Always animate
+            .always => return true,
+            // Only when focused
+            .true => if (self.flags.focused) return true,
+            // Never animate
+            .false => {},
+        }
+    }
+
+    return false;
+}
+
+fn syncDrawTimer(self: *Thread) void {
+    if (!self.drawTimerNeeded()) {
         // We're skipping the draw timer. Stop it on the next iteration.
         self.draw_active = false;
         return;
@@ -409,6 +432,10 @@ fn drainMailbox(self: *Thread) !void {
                 // Focus affects our QoS class
                 self.setQosClass();
 
+                self.state.mutex.lockUncancelable(global.io());
+                self.state.input_motion.reset();
+                self.state.mutex.unlock(global.io());
+
                 // Set it on the renderer
                 try self.renderer.setFocus(v);
 
@@ -466,7 +493,12 @@ fn drainMailbox(self: *Thread) !void {
                 grid.set.deref(grid.old_key);
             },
 
-            .resize => |v| self.renderer.setScreenSize(v),
+            .resize => |v| {
+                self.state.mutex.lockUncancelable(global.io());
+                self.state.input_motion.reset();
+                self.state.mutex.unlock(global.io());
+                self.renderer.setScreenSize(v);
+            },
 
             .change_config => |config| {
                 defer config.alloc.destroy(config.thread);
@@ -622,6 +654,13 @@ fn drawCallback(
     // Draw
     t.drawFrame(false);
 
+    // Re-evaluate whether we still need the pump. Cursor motion settles on
+    // its own without anything sending us a message, so this is where we
+    // notice it's done. We only ever clear the flag here: starting the
+    // timer is `syncDrawTimer`'s job, and the re-arm below already covers
+    // the still-running case, so we can't end up double-arming `draw_c`.
+    if (t.draw_active and !t.drawTimerNeeded()) t.draw_active = false;
+
     // Only continue if we're still active
     if (t.draw_active) {
         t.draw_h.run(&t.loop, &t.draw_c, DRAW_INTERVAL, Thread, t, drawCallback);
@@ -653,6 +692,22 @@ fn renderCallback(
         t.flags.cursor_blink_visible,
     ) catch |err|
         log.warn("error rendering err={}", .{err});
+
+    // A terminal update may have just started a cursor motion animation.
+    // `syncDrawTimer` is otherwise only re-evaluated on thread start, focus
+    // change, and config change, none of which fire on a cursor move, so
+    // this is the only place the pump can be turned on for one. We check
+    // before calling so that this is strictly additive: it can start the
+    // timer but never stop one that's already running, and when cursor
+    // motion is disabled it costs a single enum comparison.
+    if (@hasDecl(rendererpkg.Renderer, "cursorMotionActive") and
+        !t.draw_active and
+        t.renderer.cursorMotionActive())
+    {
+        t.syncDrawTimer();
+    }
+    if (@hasDecl(rendererpkg.Renderer, "inputMotionActive") and
+        !t.draw_active and t.renderer.inputMotionActive()) t.syncDrawTimer();
 
     // Draw
     t.drawFrame(false);

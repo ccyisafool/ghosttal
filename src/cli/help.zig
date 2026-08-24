@@ -35,11 +35,11 @@ pub fn run(alloc: Allocator) !u8 {
     var stdout_writer = std.Io.File.stdout().writer(global.io(), &buffer);
     const stdout = &stdout_writer.interface;
     try stdout.writeAll(
-        \\Usage: ghostty [+action] [options]
+        \\Usage: ghosttal [+action] [options]
         \\
-        \\Run the Ghostty terminal emulator or a specific helper action.
+        \\Run the Ghosttal terminal emulator or a specific helper action.
         \\
-        \\If no `+action` is specified, run the Ghostty terminal emulator.
+        \\If no `+action` is specified, run the Ghosttal terminal emulator.
         \\All configuration keys are available as command line options.
         \\To specify a configuration key, use the `--<key>=<value>` syntax
         \\where key and value are the same format you'd put into a configuration
@@ -51,11 +51,11 @@ pub fn run(alloc: Allocator) !u8 {
         \\
         \\A special command line argument `-e <command>` can be used to run
         \\the specific command inside the terminal emulator. For example,
-        \\`ghostty -e top` will run the `top` command inside the terminal.
+        \\`ghosttal -e top` will run the `top` command inside the terminal.
         \\
         \\On macOS, launching the terminal emulator from the CLI is not
-        \\supported and only actions are supported. Use `open -na Ghostty.app`
-        \\instead, or `open -na ghostty.app --args --foo=bar --baz=quz` to pass
+        \\supported and only actions are supported. Use `open -na Ghosttal.app`
+        \\instead, or `open -na Ghosttal.app --args --foo=bar --baz=quz` to pass
         \\arguments.
         \\
         \\Available actions:

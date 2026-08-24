@@ -73,10 +73,17 @@ pub const Contents = struct {
     /// calling any operations.
     fg_rows: []CellTextRow = &.{},
 
+    /// Text glyphs only, indexed one-to-one with terminal rows. Decorations
+    /// share fg_rows, so they are unsuitable when an input animation needs
+    /// to retain a just-deleted glyph after its normal row is cleared.
+    text_rows: []CellTextRow = &.{},
+
     pub fn deinit(self: *Contents, alloc: Allocator) void {
         alloc.free(self.bg_cells);
         for (self.fg_rows) |*row| row.deinit(alloc);
         alloc.free(self.fg_rows);
+        for (self.text_rows) |*row| row.deinit(alloc);
+        alloc.free(self.text_rows);
     }
 
     /// Resize the cell contents for the given grid size. This will
@@ -104,6 +111,12 @@ pub const Contents = struct {
         // can produce arbitrarily many glyphs in one column.
         const fg_row_capacity = @as(usize, size.columns) * 3;
 
+        const text_rows = try alloc.alloc(CellTextRow, row_count);
+        errdefer alloc.free(text_rows);
+        @memset(text_rows, .empty);
+        errdefer for (text_rows) |*row| row.deinit(alloc);
+        for (text_rows) |*row| row.* = try .initCapacity(alloc, size.columns);
+
         // The cursor lists need just one cell. The rest get the full capacity.
         fg_rows[0] = try .initCapacity(alloc, 1);
         fg_rows[row_count + 1] = try .initCapacity(alloc, 1);
@@ -120,9 +133,12 @@ pub const Contents = struct {
         errdefer comptime unreachable;
         for (self.fg_rows) |*row| row.deinit(alloc);
         alloc.free(self.fg_rows);
+        for (self.text_rows) |*row| row.deinit(alloc);
+        alloc.free(self.text_rows);
         self.size = size;
         self.bg_cells = bg_cells;
         self.fg_rows = fg_rows;
+        self.text_rows = text_rows;
         self.reset();
     }
 
@@ -130,6 +146,7 @@ pub const Contents = struct {
     pub fn reset(self: *Contents) void {
         @memset(self.bg_cells, .{ 0, 0, 0, 0 });
         for (self.fg_rows) |*row| row.clearRetainingCapacity();
+        for (self.text_rows) |*row| row.clearRetainingCapacity();
     }
 
     /// Set the cursor value. If the value is null then the cursor is hidden.
@@ -198,7 +215,10 @@ pub const Contents = struct {
             // We have a special list containing the cursor cell at the start
             // of our fg row collection, so we need to add 1 to the y to get
             // the correct index.
-            => try self.fg_rows[y + 1].append(alloc, cell),
+            => {
+                try self.fg_rows[y + 1].append(alloc, cell);
+                if (key == .text) try self.text_rows[y].append(alloc, cell);
+            },
         }
     }
 
@@ -212,6 +232,26 @@ pub const Contents = struct {
         // of our fg row collection, so we need to add 1 to the y to get
         // the correct index.
         self.fg_rows[y + 1].clearRetainingCapacity();
+        self.text_rows[y].clearRetainingCapacity();
+    }
+
+    /// Return a rendered text glyph at the cell's logical head. This never
+    /// yields underline/strike/overline sprites because they are excluded
+    /// from text_rows at insertion time.
+    pub fn textGlyph(self: *const Contents, row: usize, col: usize) ?shaderpkg.CellText {
+        if (row >= self.text_rows.len) return null;
+        for (self.text_rows[row].items) |glyph| {
+            if (glyph.grid_pos[0] == col) return glyph;
+        }
+        return null;
+    }
+
+    /// Cache a text glyph that is intentionally withheld from fg_rows while
+    /// an arrival animation owns its drawing. This keeps a subsequent
+    /// immediate Backspace eligible for a retained-glyph decay.
+    pub fn cacheText(self: *Contents, alloc: Allocator, cell: shaderpkg.CellText) Allocator.Error!void {
+        assert(cell.grid_pos[1] < self.size.rows);
+        try self.text_rows[cell.grid_pos[1]].append(alloc, cell);
     }
 };
 

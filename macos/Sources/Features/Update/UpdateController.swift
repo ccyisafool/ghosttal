@@ -3,7 +3,7 @@ import Cocoa
 import Combine
 import SwiftUI
 
-/// Standard controller for managing Sparkle updates in Ghostty.
+/// Update UI retained from upstream while Ghosttal's update channel is offline.
 ///
 /// This controller wraps SPUStandardUpdaterController to provide a simpler interface
 /// for managing updates with Ghostty's custom driver and delegate. It handles
@@ -35,70 +35,21 @@ class UpdateController {
         )
     }
 
-    /// Start the updater.
-    ///
-    /// This must be called before the updater can check for updates. If starting fails,
-    /// the error will be shown to the user.
+    /// Ghosttal deliberately does not start Sparkle until it has its own signed feed.
     func startUpdater() {
-        do {
-            try updater.start()
-        } catch {
-            userDriver.viewModel.state = .error(.init(
-                error: error,
-                retry: { [weak self] in
-                    self?.userDriver.viewModel.state = .idle
-                    self?.startUpdater()
-                },
-                dismiss: { [weak self] in
-                    self?.userDriver.viewModel.state = .idle
-                }
-            ))
-        }
+        // Intentionally disabled. Never point a Ghosttal build at Ghostty's feed.
     }
 
     /// Check for updates.
     ///
     /// This is typically connected to a menu item action.
     func checkForUpdates() {
-        // If we're already idle, then just check for updates immediately.
-        if viewModel.state == .idle {
-            updater.checkForUpdates()
-            return
-        }
-
-        if case let .installing(installing) = viewModel.state {
-            // If the update is already installed, we can't actually
-            // cancel it, and SPUUpdater.checkForUpdates will simply fail,
-            // so we just show an alert to remind the user to restart.
-            let alert = NSAlert()
-            alert.alertStyle = .informational
-            let accessoryView = NSHostingView(
-                rootView: InstallingAccessoryView(installing: installing)
-                    .frame(width: 228, alignment: .leading)
-            )
-            accessoryView.frame = .init(origin: .zero, size: accessoryView.fittingSize)
-            alert.accessoryView = accessoryView
-            alert.addButton(withTitle: "Restart Now")
-            alert.addButton(withTitle: "Restart Later")
-                .keyEquivalent = .init([KeyboardShortcut(.escape).key.character])
-            switch alert.runModal() {
-            case .alertFirstButtonReturn:
-                viewModel.state.confirm()
-            default:
-                break
-            }
-            return
-        }
-
-        // If we're not idle then we need to cancel any prior state.
-        viewModel.state.cancel()
-
-        // The above will take time to settle, so we delay the check for some time.
-        // The 100ms is arbitrary and I'd rather not, but we have to wait more than
-        // one loop tick it seems.
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self] in
-            self?.updater.checkForUpdates()
-        }
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Ghosttal updates are not enabled yet"
+        alert.informativeText = "This sanity-check build never contacts Ghostty's update service. Ghosttal will gain its own signed update channel later."
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 }
 

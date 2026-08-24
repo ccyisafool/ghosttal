@@ -7,13 +7,23 @@ const Allocator = std.mem.Allocator;
 
 /// Verifies that the running macOS system version is at least the given version.
 pub fn isAtLeastVersion(major: i64, minor: i64, patch: i64) bool {
-    comptime assert(builtin.target.os.tag.isDarwin());
+    comptime assert(builtin.target.os.tag == .macos);
 
     const NSProcessInfo = objc.getClass("NSProcessInfo").?;
     const info = NSProcessInfo.msgSend(objc.Object, objc.sel("processInfo"), .{});
     return info.msgSend(bool, objc.sel("isOperatingSystemAtLeastVersion:"), .{
         NSOperatingSystemVersion{ .major = major, .minor = minor, .patch = patch },
     });
+}
+
+/// AppKit's system accessibility preference. Callers are expected to guard
+/// this with a macOS comptime branch; keeping it here makes non-macOS builds
+/// entirely free of Objective-C/AppKit references.
+pub fn accessibilityDisplayShouldReduceMotion() bool {
+    comptime assert(builtin.target.os.tag == .macos);
+    const NSWorkspace = objc.getClass("NSWorkspace") orelse return false;
+    const workspace = NSWorkspace.msgSend(objc.Object, objc.sel("sharedWorkspace"), .{});
+    return workspace.msgSend(bool, objc.sel("accessibilityDisplayShouldReduceMotion"), .{});
 }
 
 pub const AppSupportDirError = Allocator.Error || error{AppleAPIFailed};
@@ -25,9 +35,21 @@ pub fn appSupportDir(
     alloc: Allocator,
     sub_path: []const u8,
 ) AppSupportDirError![]const u8 {
+    return try appSupportDirForBundle(alloc, build_config.bundle_id, sub_path);
+}
+
+/// Return the path to the application support directory for an explicit
+/// bundle identifier. Ghosttal uses this to inherit Ghostty's configuration
+/// before applying its own config overlay.
+pub fn appSupportDirForBundle(
+    alloc: Allocator,
+    bundle_id: []const u8,
+    sub_path: []const u8,
+) AppSupportDirError![]const u8 {
     return try commonDir(
         alloc,
         .NSApplicationSupportDirectory,
+        bundle_id,
         sub_path,
     );
 }
@@ -43,6 +65,7 @@ pub fn cacheDir(
     return try commonDir(
         alloc,
         .NSCachesDirectory,
+        build_config.bundle_id,
         sub_path,
     );
 }
@@ -110,6 +133,7 @@ pub const NSSearchPathDomainMask = enum(c_ulong) {
 fn commonDir(
     alloc: Allocator,
     directory: NSSearchPathDirectory,
+    bundle_id: []const u8,
     sub_path: []const u8,
 ) (error{AppleAPIFailed} || Allocator.Error)![]const u8 {
     comptime assert(builtin.target.os.tag.isDarwin());
@@ -142,7 +166,7 @@ fn commonDir(
 
     return try std.fs.path.join(
         alloc,
-        &.{ base_dir, build_config.bundle_id, sub_path },
+        &.{ base_dir, bundle_id, sub_path },
     );
 }
 

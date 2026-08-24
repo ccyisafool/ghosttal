@@ -106,15 +106,15 @@
 	</array>
 	<key>SUEnableAutomaticChecks</key>
 	<false/>
-	<key>SUPublicEDKey</key>
-	<string>wsNcGf5hirwtdXMVnYoxRIX/SqZQLMOsYlD3q3imeok=</string>
+	<key>GhosttalUpdatesDisabled</key>
+	<true/>
 	<key>UTExportedTypeDeclarations</key>
 	<array>
 		<dict>
 			<key>UTTypeIdentifier</key>
-			<string>com.mitchellh.ghosttySurfaceId</string>
+			<string>com.chenyangcheng.ghosttalSurfaceId</string>
 			<key>UTTypeDescription</key>
-			<string>Ghostty Surface Identifier</string>
+			<string>Ghosttal Surface Identifier</string>
 			<key>UTTypeConformsTo</key>
 			<array>
 				<string>public.data</string>

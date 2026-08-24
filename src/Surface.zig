@@ -2833,6 +2833,73 @@ pub fn keyCallback(
             return .closed;
         }
 
+        // Record only a successfully encoded local key that will actually
+        // reach a live child. textCallback and paste deliberately never use
+        // this path, so renderer effects can never be inferred from output.
+        if (event.action != .release) {
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
+            const intent = &self.renderer_state.input_motion;
+            const screens = &self.renderer_state.terminal.screens;
+            const now = std.Io.Timestamp.now(global.io(), .awake);
+            if (event.utf8.len > 0) {
+                const cursor = screens.active.cursor;
+                intent.recordText(event.utf8, cursor.x, cursor.y, @intCast(@intFromEnum(screens.active_key)), screens.generation(screens.active_key), now);
+            } else switch (event.key) {
+                .backspace, .numpad_backspace => delete: {
+                    // Capture the logical glyph head before the child can
+                    // echo/delete it. A wide spacer tail is never rendered,
+                    // so retain its preceding wide head instead.
+                    const screen = screens.active;
+                    const source = screen.cursor;
+                    if (source.x == 0) break :delete;
+                    const immediate = screen.cursorCellLeft(1);
+                    const target = if (immediate.wide == .spacer_tail)
+                        screen.cursorCellLeft(2)
+                    else
+                        immediate;
+                    const target_offset: u16 = if (immediate.wide == .spacer_tail) 2 else 1;
+                    const target_col = source.x - target_offset;
+                    intent.recordBackwardDelete(
+                        source.x,
+                        source.y,
+                        @intCast(@intFromEnum(screens.active_key)),
+                        screens.generation(screens.active_key),
+                        target_col,
+                        target.codepoint(),
+                        target.gridWidth(),
+                        now,
+                    );
+                },
+                .enter, .numpad_enter => commit: {
+                    // Commit effects are deliberately shell-semantic, not a
+                    // general newline animation. OSC 133 B marks the editable
+                    // input region; without it an Enter may belong to a TUI.
+                    const screen = screens.active;
+                    const source = screen.cursor;
+                    if (source.semantic_content != .input) break :commit;
+
+                    // Preserve only the same visual row's input span. The
+                    // renderer later takes text glyphs from its bounded cache
+                    // and independently verifies OSC 133 C before drawing.
+                    const cells = source.page_pin.node.page().getCells(source.page_row);
+                    var input_start: u16 = source.x;
+                    while (input_start > 0 and cells[input_start - 1].semantic_content == .input) {
+                        input_start -= 1;
+                    }
+                    intent.recordCommit(
+                        source.x,
+                        source.y,
+                        @intCast(@intFromEnum(screens.active_key)),
+                        screens.generation(screens.active_key),
+                        input_start,
+                        now,
+                    );
+                },
+                else => {},
+            }
+        }
+
         self.queueIo(switch (write_req) {
             .small => |v| .{ .write_small = v },
             .stable => |v| .{ .write_stable = v },

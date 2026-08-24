@@ -10,9 +10,9 @@ class DockTilePlugin: NSObject, NSDockTilePlugIn {
     // Separate defaults based on debug vs release builds so we can test icons
     // without messing up releases.
     #if DEBUG
-    private let ghosttyUserDefaults = UserDefaults(suiteName: "com.mitchellh.ghostty.debug")
+    private let ghosttyUserDefaults = UserDefaults(suiteName: "com.chenyangcheng.ghosttal.debug")
     #else
-    private let ghosttyUserDefaults = UserDefaults(suiteName: "com.mitchellh.ghostty")
+    private let ghosttyUserDefaults = UserDefaults(suiteName: "com.chenyangcheng.ghosttal")
     #endif
 
     private var iconChangeObserver: Any?
@@ -55,7 +55,7 @@ class DockTilePlugin: NSObject, NSDockTilePlugIn {
             // Use the `Blueprint` icon to distinguish Debug from Release builds.
             appIcon = pluginBundle.image(forResource: "BlueprintImage")!
             #else
-            // Reset to Ghostty.icon
+            // Reset to Ghosttal.icon
             appIcon = nil
             #endif
         } else {

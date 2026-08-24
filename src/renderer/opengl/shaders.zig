@@ -26,6 +26,20 @@ const pipeline_descs: []const struct { [:0]const u8, PipelineDescription } =
             .step_fn = .per_instance,
             .blending_enabled = true,
         } },
+        .{ "cursor", .{
+            .vertex_attributes = CursorQuad,
+            .vertex_fn = loadShaderCode("../shaders/glsl/cursor.v.glsl"),
+            .fragment_fn = loadShaderCode("../shaders/glsl/cursor.f.glsl"),
+            .step_fn = .per_instance,
+            .blending_enabled = true,
+        } },
+        .{ "input_glyph", .{
+            .vertex_attributes = InputGlyphQuad,
+            .vertex_fn = loadShaderCode("../shaders/glsl/input_glyph.v.glsl"),
+            .fragment_fn = loadShaderCode("../shaders/glsl/input_glyph.f.glsl"),
+            .step_fn = .per_instance,
+            .blending_enabled = true,
+        } },
         .{ "image", .{
             .vertex_attributes = Image,
             .vertex_fn = loadShaderCode("../shaders/glsl/image.v.glsl"),
@@ -252,6 +266,76 @@ pub const CellText = extern struct {
 
 /// This is a single parameter for the cell bg shader.
 pub const CellBg = [4]u8;
+
+/// Single parameter for the animated cursor shader ("cursor motion").
+///
+/// Unlike `CellText`, this quad is positioned in free-floating pixels
+/// instead of being snapped to a grid cell, which is what lets the cursor
+/// be drawn part way between two cells. The glyph is stretched to fill the
+/// quad, so a block cursor scales cleanly and a bar or underline stretches
+/// along the direction of travel.
+///
+/// Cursor sprites always live in the grayscale atlas, so unlike `CellText`
+/// there's no atlas selector and no color atlas to sample.
+///
+/// This must stay in sync with the Metal `CursorQuad` and with the vertex
+/// attribute locations in `glsl/cursor.v.glsl`.
+pub const CursorQuad = extern struct {
+    /// Top-left corner of the quad in pixels, in the same space as
+    /// `cell_size * grid_pos` in the other shaders: relative to the
+    /// top-left of the grid, with the window padding applied afterwards
+    /// by the projection matrix.
+    pos: [2]f32 align(8),
+
+    /// Size of the quad in pixels.
+    size: [2]f32 align(8),
+
+    /// Pixel-space basis. Kept layout-compatible with Metal even though
+    /// caret motion is currently a macOS-first feature.
+    basis_x: [2]f32 align(8),
+    basis_y: [2]f32 align(8),
+
+    /// The position of the glyph in the grayscale atlas (x, y).
+    glyph_pos: [2]u32 align(8),
+
+    /// The size of the glyph in the grayscale atlas (w, h).
+    glyph_size: [2]u32 align(8),
+
+    /// The cursor color. The alpha channel carries the configured cursor
+    /// opacity and, for the trail quad, its fade.
+    color: [4]u8 align(4),
+};
+
+/// Kept byte-for-byte compatible with the Metal InputGlyphQuad. The generic
+/// renderer owns this short-lived overlay, so every backend needs its ABI.
+pub const InputGlyphQuad = extern struct {
+    pos: [2]f32 align(8),
+    glyph_pos: [2]u32 align(8),
+    glyph_size: [2]u32 align(8),
+    grid_pos: [2]u16 align(4),
+    color: [4]u8 align(4),
+    atlas: CellText.Atlas align(1),
+    bools: packed struct(u8) {
+        no_min_contrast: bool = false,
+        _padding: u7 = 0,
+    } align(1) = .{},
+    opacity: u8 align(1) = 255,
+    /// Must remain byte-for-byte compatible with Metal InputGlyphQuad.
+    draw_size: [2]f32 align(8),
+
+    test {
+        try std.testing.expectEqual(48, @sizeOf(InputGlyphQuad));
+        try std.testing.expectEqual(0, @offsetOf(InputGlyphQuad, "pos"));
+        try std.testing.expectEqual(8, @offsetOf(InputGlyphQuad, "glyph_pos"));
+        try std.testing.expectEqual(16, @offsetOf(InputGlyphQuad, "glyph_size"));
+        try std.testing.expectEqual(24, @offsetOf(InputGlyphQuad, "grid_pos"));
+        try std.testing.expectEqual(28, @offsetOf(InputGlyphQuad, "color"));
+        try std.testing.expectEqual(32, @offsetOf(InputGlyphQuad, "atlas"));
+        try std.testing.expectEqual(33, @offsetOf(InputGlyphQuad, "bools"));
+        try std.testing.expectEqual(34, @offsetOf(InputGlyphQuad, "opacity"));
+        try std.testing.expectEqual(40, @offsetOf(InputGlyphQuad, "draw_size"));
+    }
+};
 
 /// Single parameter for the image shader. See shader for field details.
 pub const Image = extern struct {

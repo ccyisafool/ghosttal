@@ -759,6 +759,228 @@ fragment float4 cell_text_fragment(
     }
   }
 }
+
+//-------------------------------------------------------------------
+// Input Glyph Shader
+//-------------------------------------------------------------------
+// A confirmed local echo is withheld from cell_text for its configured
+// arrival and drawn by this free-floating instance instead. Its position and
+// alpha are sampled on the CPU so no global shader clock is needed.
+struct InputGlyphVertexIn {
+  float2 pos [[attribute(0)]];
+  uint2 glyph_pos [[attribute(1)]];
+  uint2 glyph_size [[attribute(2)]];
+  ushort2 grid_pos [[attribute(3)]];
+  uchar4 color [[attribute(4)]];
+  uint8_t atlas [[attribute(5)]];
+  uint8_t bools [[attribute(6)]];
+  uint8_t opacity [[attribute(7)]];
+  float2 draw_size [[attribute(8)]];
+};
+
+vertex CellTextVertexOut input_glyph_vertex(
+  uint vid [[vertex_id]], InputGlyphVertexIn in [[stage_in]],
+  constant Uniforms& uniforms [[buffer(1)]],
+  constant uchar4 *bg_colors [[buffer(2)]]
+) {
+  float2 corner = float2(float(vid == 1 || vid == 3), float(vid == 2 || vid == 3));
+  CellTextVertexOut out;
+  out.atlas = in.atlas;
+  out.position = uniforms.projection_matrix * float4(in.pos + in.draw_size * corner, 0.0f, 1.0f);
+  out.tex_coord = float2(in.glyph_pos) + float2(in.glyph_size) * corner;
+  out.color = load_color(in.color, uniforms.use_display_p3, true);
+  out.bg_color = load_color(bg_colors[in.grid_pos.y * uniforms.grid_size.x + in.grid_pos.x], uniforms.use_display_p3, true);
+  float4 global_bg = load_color(uniforms.bg_color, uniforms.use_display_p3, true);
+  out.bg_color += global_bg * (1.0 - out.bg_color.a);
+  if (uniforms.min_contrast > 1.0f && (in.bools & NO_MIN_CONTRAST) == 0) {
+    out.color = contrasted_color(uniforms.min_contrast, out.color, out.bg_color);
+  }
+  bool is_cursor_pos = (in.grid_pos.x == uniforms.cursor_pos.x ||
+    (uniforms.cursor_wide && in.grid_pos.x == uniforms.cursor_pos.x + 1)) &&
+    in.grid_pos.y == uniforms.cursor_pos.y;
+  if (is_cursor_pos) out.color = load_color(uniforms.cursor_color, uniforms.use_display_p3, true);
+  // Fade is applied last: min-contrast and cursor recoloring are allowed to
+  // choose RGB, but must never restore the arrival glyph to opaque.
+  out.color *= float(in.opacity) / 255.0f;
+  return out;
+}
+
+fragment float4 input_glyph_fragment(
+  CellTextVertexOut in [[stage_in]], texture2d<float> textureGrayscale [[texture(0)]],
+  texture2d<float> textureColor [[texture(1)]], constant Uniforms& uniforms [[buffer(1)]]) {
+  constexpr sampler textureSampler(coord::pixel, address::clamp_to_edge, filter::nearest);
+  switch (in.atlas) {
+    default:
+    case ATLAS_GRAYSCALE: {
+      float4 color = in.color;
+      if (!uniforms.use_linear_blending && color.a > 0.0f) {
+        color.rgb /= color.a;
+        color = unlinearize(color);
+        color.rgb *= color.a;
+      }
+      float a = textureGrayscale.sample(textureSampler, in.tex_coord).r;
+      if (uniforms.use_linear_correction) {
+        float fg_l = luminance(color.rgb);
+        float bg_l = luminance(in.bg_color.rgb);
+        if (abs(fg_l - bg_l) > 0.001f) {
+          float blend_l = linearize(unlinearize(fg_l) * a + unlinearize(bg_l) * (1.0f - a));
+          a = clamp((blend_l - bg_l) / (fg_l - bg_l), 0.0f, 1.0f);
+        }
+      }
+      return color * a;
+    }
+    case ATLAS_COLOR: {
+      float4 color = textureColor.sample(textureSampler, in.tex_coord);
+      color *= in.color.a;
+      // The source glyph is premultiplied; alpha comes from the CPU-side
+      // color only for grayscale glyphs, exactly like cell_text.
+      if (uniforms.use_linear_blending || color.a == 0.0f) return color;
+      color.rgb /= color.a;
+      color = unlinearize(color);
+      color.rgb *= color.a;
+      return color;
+    }
+  }
+}
+
+//-------------------------------------------------------------------
+// Cursor Shader
+//-------------------------------------------------------------------
+#pragma mark - Cursor Shader
+
+// The animated cursor ("cursor motion"). Unlike the cell text shader,
+// this quad is positioned in free-floating pixels rather than being
+// snapped to a grid cell, which is what lets the cursor be drawn part
+// way between two cells. The sprite is stretched to fill the quad.
+//
+// This must stay in sync with the `CursorQuad` struct in
+// `src/renderer/metal/shaders.zig` and with `glsl/cursor.v.glsl`.
+
+struct CursorVertexIn {
+  // The top-left corner of the quad in pixels, relative to the top-left
+  // of the grid. The window padding is applied by the projection matrix,
+  // just like it is for cell_text and image.
+  float2 quad_pos [[attribute(0)]];
+
+  // The size of the quad in pixels.
+  float2 quad_size [[attribute(1)]];
+
+  // Pixel-space axes for the quad. The cursor head uses the identity basis;
+  // a motion trail uses a travel-aligned basis so diagonal moves stay a thin
+  // ribbon instead of becoming a filled axis-aligned rectangle.
+  float2 basis_x [[attribute(2)]];
+  float2 basis_y [[attribute(3)]];
+
+  // The position of the glyph in the grayscale atlas (x, y).
+  uint2 glyph_pos [[attribute(4)]];
+
+  // The size of the glyph in the grayscale atlas (w, h).
+  uint2 glyph_size [[attribute(5)]];
+
+  // The color of the cursor. The alpha carries the configured cursor
+  // opacity and, for the trail quad, its fade.
+  uchar4 color [[attribute(6)]];
+};
+
+struct CursorVertexOut {
+  float4 position [[position]];
+  float4 color [[flat]];
+  float2 tex_coord;
+};
+
+vertex CursorVertexOut cursor_vertex(
+  uint vid [[vertex_id]],
+  CursorVertexIn in [[stage_in]],
+  constant Uniforms& uniforms [[buffer(1)]]
+) {
+  // We use a triangle strip with 4 vertices to render quads,
+  // so we determine which corner of the quad this vertex is in
+  // based on the vertex ID.
+  //
+  //   0 --> 1
+  //   |   .'|
+  //   |  /  |
+  //   | L   |
+  //   2 --> 3
+  //
+  // 0 = top-left  (0, 0)
+  // 1 = top-right (1, 0)
+  // 2 = bot-left  (0, 1)
+  // 3 = bot-right (1, 1)
+  float2 corner;
+  corner.x = float(vid == 1 || vid == 3);
+  corner.y = float(vid == 2 || vid == 3);
+
+  CursorVertexOut out;
+
+  // Unlike cell_text there is no `cell_size * grid_pos` term and no
+  // bearing math here: the animation hands us the final pixel rect
+  // directly, bearings already folded in, so that it can place the
+  // cursor part way between two cells.
+  float2 pos = in.quad_pos +
+      in.basis_x * (in.quad_size.x * corner.x) +
+      in.basis_y * (in.quad_size.y * corner.y);
+  out.position =
+      uniforms.projection_matrix * float4(pos.x, pos.y, 0.0f, 1.0f);
+
+  // The texture coordinate is in pixels, not normalized, since we sample
+  // with pixel coordinate mode. Stretching the quad stretches the sprite
+  // with it.
+  out.tex_coord = float2(in.glyph_pos) + float2(in.glyph_size) * corner;
+
+  // As in cell_text, we always fetch a linearized color and let the
+  // fragment shader re-encode it if we aren't blending in linear space.
+  out.color = load_color(
+    in.color,
+    uniforms.use_display_p3,
+    true
+  );
+
+  return out;
+}
+
+fragment float4 cursor_fragment(
+  CursorVertexOut in [[stage_in]],
+  texture2d<float> textureGrayscale [[texture(0)]],
+  constant Uniforms& uniforms [[buffer(1)]]
+) {
+  constexpr sampler textureSampler(
+    coord::pixel,
+    address::clamp_to_edge,
+    filter::nearest
+  );
+
+  // Our input color is always linear.
+  float4 color = in.color;
+
+  // If we're not doing linear blending, then we need to re-apply the
+  // gamma encoding to our color manually.
+  //
+  // Since the alpha is premultiplied, we need to divide it out before
+  // unlinearizing and re-multiply it after. The trail quad can fade all
+  // the way to zero alpha, so unlike cell_text we have to guard the
+  // division.
+  if (!uniforms.use_linear_blending && color.a > 0.0f) {
+    color.rgb /= color.a;
+    color = unlinearize(color);
+    color.rgb *= color.a;
+  }
+
+  // Fetch our alpha mask for this pixel. Cursor sprites are always in
+  // the grayscale atlas, so there's no atlas selector here.
+  //
+  // Note we deliberately don't do the linear blending weight correction
+  // that cell_text does: it needs the cell background color, which a
+  // free-floating quad doesn't have.
+  float a = textureGrayscale.sample(textureSampler, in.tex_coord).r;
+
+  // Multiply our whole color by the alpha mask. Since we use
+  // premultiplied alpha, this is the correct way to apply the mask.
+  color *= a;
+
+  return color;
+}
+
 //-------------------------------------------------------------------
 // Image Shader
 //-------------------------------------------------------------------
@@ -850,4 +1072,3 @@ fragment float4 image_fragment(
 
   return rgba;
 }
-

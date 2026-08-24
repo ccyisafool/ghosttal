@@ -25,6 +25,7 @@ pub const CopyOnSelect = Config.CopyOnSelect;
 pub const RightClickAction = Config.RightClickAction;
 pub const MiddleClickAction = Config.MiddleClickAction;
 pub const CustomShaderAnimation = Config.CustomShaderAnimation;
+pub const CursorMotion = Config.CursorMotion;
 pub const FontSyntheticStyle = Config.FontSyntheticStyle;
 pub const FontShapingBreak = Config.FontShapingBreak;
 pub const FontStyle = Config.FontStyle;

@@ -14,6 +14,8 @@ const math = @import("../math.zig");
 const Surface = @import("../Surface.zig");
 const link = @import("link.zig");
 const cellpkg = @import("cell.zig");
+const motionpkg = @import("cursor_motion.zig");
+const inputmotion = @import("input_motion.zig");
 const noMinContrast = cellpkg.noMinContrast;
 const constraintWidth = cellpkg.constraintWidth;
 const isCovering = cellpkg.isCovering;
@@ -44,6 +46,71 @@ const DisplayLink = switch (builtin.os.tag) {
 };
 
 const log = std.log.scoped(.generic_renderer);
+
+/// Map the `cursor-motion` config value on to an animation style. Returns
+/// null for `none`, which means cursor motion is disabled entirely and the
+/// cursor stays in the shared cell_text pipeline.
+fn cursorMotionStyle(v: configpkg.CursorMotion) ?motionpkg.Style {
+    return switch (v) {
+        .none => null,
+        .ease => .ease,
+        .spring => .spring,
+        .smear => .smear,
+        .squash => .squash,
+    };
+}
+
+/// The pixel rect that a cursor `CellText` instance occupies, in the same
+/// top-left space that the vertex shaders compute from `cell_size *
+/// grid_pos`: relative to the top-left of the grid, with the window padding
+/// applied afterwards by the projection matrix.
+///
+/// This mirrors the bearing math in `cell_text_vertex`. The X bearing is
+/// the offset from the left of the cell, and the Y bearing is measured from
+/// the *bottom* of the cell up to the top of the glyph, so the top edge of
+/// the glyph is `cell_height - bearing_y` below the top of the cell.
+///
+/// A wide cursor needs no special handling here: `addCursor` rasterizes the
+/// sprite at two cells wide, so the width is already in `glyph_size`.
+///
+/// `cell` is duck-typed because each graphics API has its own `CellText`.
+fn cursorCellRect(cell: anytype, metrics: font.Metrics) motionpkg.Rect {
+    const cell_width: f32 = @floatFromInt(metrics.cell_width);
+    const cell_height: f32 = @floatFromInt(metrics.cell_height);
+    const bearing_x: f32 = @floatFromInt(cell.bearings[0]);
+    const bearing_y: f32 = @floatFromInt(cell.bearings[1]);
+    return .{
+        .pos = .{
+            (@as(f32, @floatFromInt(cell.grid_pos[0])) * cell_width) +
+                bearing_x,
+            (@as(f32, @floatFromInt(cell.grid_pos[1])) * cell_height) +
+                (cell_height - bearing_y),
+        },
+        .size = .{
+            @floatFromInt(cell.glyph_size[0]),
+            @floatFromInt(cell.glyph_size[1]),
+        },
+    };
+}
+
+/// The cell whose text should use the block-cursor foreground color once an
+/// animated block cursor has arrived. While the cursor is between cells we
+/// deliberately leave this unset in the shader: there is no single cell that
+/// is visually under the free-floating cursor quad.
+const CursorTextTarget = struct {
+    pos: [2]u16,
+    wide: bool,
+};
+
+/// A moving block cursor must not recolor its destination text early. Once
+/// the cursor is resting (including an explicit snap), restore the legacy
+/// block-cursor text behavior at its target cell.
+fn cursorTextInversionTarget(
+    target: ?CursorTextTarget,
+    animating: bool,
+) ?CursorTextTarget {
+    return if (animating) null else target;
+}
 
 /// Create a renderer type with the provided graphics API wrapper.
 ///
@@ -159,6 +226,50 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// The current GPU uniform values.
         uniforms: shaderpkg.Uniforms,
+
+        /// Animated cursor state. Inert unless `cursor-motion` is set to
+        /// something other than `none`. See `CursorMotionState`.
+        cursor_motion: CursorMotionState,
+
+        /// The only cursor-motion state read by the render-thread scheduler
+        /// without `draw_mutex`. All detailed animation state stays behind
+        /// that mutex; this atomic is published after each retarget/sample.
+        cursor_motion_active: std.atomic.Value(bool) = .init(false),
+
+        /// Set while the one-shot local-echo glyph needs draw-only pump
+        /// frames. Like cursor_motion_active this is deliberately atomic:
+        /// the render thread reads it without draw_mutex.
+        input_motion_active: std.atomic.Value(bool) = .init(false),
+
+        /// Kept as an overlay until its row next rebuilds, so the final
+        /// steady glyph is never drawn twice.
+        input_glyph_motion: ?struct {
+            quad: ?shaderpkg.InputGlyphQuad = null,
+            /// Accessibility/config cancellation retains the withheld glyph
+            /// as a static overlay until its normal row rebuild restores
+            /// CellText. It must never simply disappear.
+            force_static: bool = false,
+            start: std.Io.Timestamp,
+            generation: u64,
+            row: u16,
+            col: u16,
+        } = null,
+
+        /// Retained pre-delete glyph plus a tiny, bounded afterimage fan.
+        /// This is deliberately separate from CellText: the terminal row is
+        /// rebuilt normally underneath it as soon as local echo arrives.
+        input_decay_motion: ?struct {
+            quad: shaderpkg.InputGlyphQuad,
+            start: std.Io.Timestamp,
+        } = null,
+
+        /// A short, OSC-133-confirmed afterimage of a submitted input row.
+        /// The fixed storage keeps command commits bounded even for long lines.
+        input_commit_motion: ?struct {
+            quads: [inputmotion.commit_quad_count]shaderpkg.InputGlyphQuad,
+            len: usize,
+            start: std.Io.Timestamp,
+        } = null,
 
         /// Custom shader uniform values.
         custom_shader_uniforms: shadertoy.Uniforms,
@@ -322,6 +433,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             cells: CellTextBuffer,
             cells_bg: CellBgBuffer,
 
+            /// Vertex data for the animated cursor quads. At most two
+            /// instances are ever drawn, so this is tiny enough that we
+            /// don't bother making it conditional on `cursor-motion`.
+            cursor: CursorBuffer,
+
+            input_glyph: InputGlyphBuffer,
+
             grayscale: Texture,
             grayscale_modified: usize = 0,
             color: Texture,
@@ -345,6 +463,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const UniformBuffer = Buffer(shaderpkg.Uniforms);
             const CellBgBuffer = Buffer(shaderpkg.CellBg);
             const CellTextBuffer = Buffer(shaderpkg.CellText);
+            const CursorBuffer = Buffer(shaderpkg.CursorQuad);
+            const InputGlyphBuffer = Buffer(shaderpkg.InputGlyphQuad);
             const BgImageBuffer = Buffer(shaderpkg.BgImage);
 
             pub fn init(api: GraphicsAPI, custom_shaders: bool) !FrameState {
@@ -364,6 +484,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 errdefer cells.deinit();
                 var cells_bg = try CellBgBuffer.init(api.bgBufferOptions(), 1);
                 errdefer cells_bg.deinit();
+
+                // The animated cursor never needs more than two instances
+                // (a trail and the cursor itself) so we size it exactly.
+                var cursor = try CursorBuffer.init(api.instanceBufferOptions(), 2);
+                errdefer cursor.deinit();
+                var input_glyph = try InputGlyphBuffer.init(
+                    api.instanceBufferOptions(),
+                    inputmotion.max_overlay_quads,
+                );
+                errdefer input_glyph.deinit();
 
                 // Create a GPU buffer for our background image info.
                 var bg_image_buffer = try BgImageBuffer.init(
@@ -404,6 +534,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .uniforms = uniforms,
                     .cells = cells,
                     .cells_bg = cells_bg,
+                    .cursor = cursor,
+                    .input_glyph = input_glyph,
                     .bg_image_buffer = bg_image_buffer,
                     .grayscale = grayscale,
                     .color = color,
@@ -417,6 +549,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.uniforms.deinit();
                 self.cells.deinit();
                 self.cells_bg.deinit();
+                self.cursor.deinit();
+                self.input_glyph.deinit();
                 self.grayscale.deinit();
                 self.color.deinit();
                 self.bg_image_buffer.deinit();
@@ -537,6 +671,103 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
         };
 
+        /// State for the animated cursor, a.k.a. "caret motion".
+        ///
+        /// This is only used when `cursor-motion` is not `none`. When it is
+        /// `none` the whole thing is inert: the cursor stays in the shared
+        /// cell_text pipeline exactly as it always has, and the only cost is
+        /// a single enum comparison on the paths that would otherwise touch
+        /// this state.
+        ///
+        /// The animation itself lives in `cursor_motion.zig` and knows
+        /// nothing about the renderer. All this struct does is decide when
+        /// to retarget it, when to snap it, and what to draw.
+        const CursorMotionState = struct {
+            /// The pure animation state machine.
+            anim: motionpkg.CursorMotion,
+
+            /// The epoch for `anim`'s millisecond clock. Null until the
+            /// first time we need a timestamp.
+            ///
+            /// This is deliberately its own clock rather than the custom
+            /// shader `time` uniform: `f32` milliseconds start losing
+            /// sub-frame precision after a few hours of uptime, which would
+            /// show up as stutter, so we rebase the epoch whenever the
+            /// animation is idle. See `cursorMotionTimeStart`.
+            epoch: ?std.Io.Timestamp = null,
+
+            /// The cursor sprite and color captured by the most recent
+            /// `rebuildCells`. Null means the cursor isn't currently drawn
+            /// (blink off phase, scrolled out of the viewport, preedit
+            /// active), in which case we draw nothing but keep the
+            /// animation state.
+            head: ?Head = null,
+
+            /// Legacy cell representation retained solely so an OS Reduce
+            /// Motion toggle can restore the non-animated cursor immediately
+            /// without waiting for another terminal snapshot.
+            legacy_cell: ?shaderpkg.CellText = null,
+            legacy_style: ?renderer.CursorStyle = null,
+
+            /// The solid block sprite used to draw the trail quad, so that
+            /// the trail reads as a streak regardless of the cursor's own
+            /// shape. Only populated for styles that produce trails.
+            trail: ?Glyph = null,
+
+            /// True if the cursor should be drawn on top of the text rather
+            /// than underneath it. This mirrors the ordering that
+            /// `cell.Contents.setCursor` gives the cursor in the cell_text
+            /// pipeline, so that both paths look the same.
+            over_text: bool = false,
+
+            /// The destination cell for block-cursor text inversion. This
+            /// is separate from the pixel animation rect: text is only
+            /// recolored after the free-floating cursor has arrived.
+            block_text_target: ?CursorTextTarget = null,
+
+            /// Set when the next target must be applied instantly rather
+            /// than animated: the cursor was hidden, the grid was resized,
+            /// the font changed, focus changed, or the config changed.
+            ///
+            /// Starts true so that the very first cursor placement doesn't
+            /// fly in from the origin.
+            snap: bool = true,
+
+            /// True if the frame we most recently drew was mid-animation.
+            /// This makes us draw exactly one more frame after `isActive`
+            /// goes false, so that we always present the resting position
+            /// rather than stopping a fraction of a pixel short.
+            pending: bool = false,
+
+            /// The rect we sampled for the frame we most recently drew.
+            /// Custom shaders read the cursor position from here so that
+            /// they follow the animation rather than the grid cell.
+            last_rect: motionpkg.Rect = .zero,
+
+            /// A glyph in the grayscale atlas.
+            const Glyph = struct {
+                pos: [2]u32,
+                size: [2]u32,
+            };
+
+            /// The cursor quad itself.
+            const Head = struct {
+                glyph: Glyph,
+                color: [4]u8,
+            };
+        };
+
+        /// The GPU quads to draw for the animated cursor this frame. At most
+        /// two: an optional trail quad, which is drawn first so that the
+        /// cursor draws over it, and the cursor itself.
+        const CursorQuads = struct {
+            quads: [2]shaderpkg.CursorQuad = undefined,
+            len: usize = 0,
+
+            /// See `CursorMotionState.over_text`.
+            over_text: bool = false,
+        };
+
         /// The configuration for this renderer that is derived from the main
         /// configuration. This must be exported so that we don't need to
         /// pass around Config pointers which makes memory management a pain.
@@ -550,6 +781,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             font_shaping_break: configpkg.FontShapingBreak,
             cursor_color: ?configpkg.Config.TerminalColor,
             cursor_opacity: f64,
+            cursor_motion: configpkg.CursorMotion,
+            cursor_motion_duration: u32,
+            cursor_motion_respect_reduce_motion: bool,
+            input_motion: bool,
+            input_motion_duration: u32,
+            input_motion_intensity: f32,
+            input_motion_respect_reduce_motion: bool,
             cursor_text: ?configpkg.Config.TerminalColor,
             background: terminal.color.RGB,
             background_opacity: f64,
@@ -623,6 +861,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .cursor_color = config.@"cursor-color",
                     .cursor_text = config.@"cursor-text",
                     .cursor_opacity = @max(0, @min(1, config.@"cursor-opacity")),
+                    .cursor_motion = config.@"cursor-motion",
+                    .cursor_motion_duration = @min(1000, config.@"cursor-motion-duration"),
+                    .cursor_motion_respect_reduce_motion = config.@"cursor-motion-respect-reduce-motion",
+                    .input_motion = config.@"input-motion",
+                    .input_motion_duration = @min(1000, config.@"input-motion-duration"),
+                    .input_motion_intensity = @floatCast(@max(0, @min(1, config.@"input-motion-intensity"))),
+                    .input_motion_respect_reduce_motion = config.@"input-motion-respect-reduce-motion",
 
                     .background = config.background.toTerminalRGB(),
                     .foreground = config.foreground.toTerminalRGB(),
@@ -740,6 +985,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         .use_linear_correction = options.config.blending == .@"linear-corrected",
                     },
                 },
+                // The style here is only consulted while motion is enabled,
+                // so `none` can map to anything; `changeConfig` keeps it up
+                // to date from then on.
+                .cursor_motion = .{ .anim = .init(
+                    cursorMotionStyle(options.config.cursor_motion) orelse .ease,
+                    @floatFromInt(options.config.cursor_motion_duration),
+                ) },
                 .custom_shader_uniforms = .{
                     .resolution = .{ 0, 0, 1 },
                     .time = 0,
@@ -1000,7 +1252,75 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// True if our renderer has animations so that a higher frequency
         /// timer is used.
         pub fn hasAnimations(self: *const Self) bool {
-            return self.has_custom_shaders;
+            return self.has_custom_shaders or self.cursorMotionActive() or self.inputMotionActive();
+        }
+
+        /// True if the cursor motion animation needs more frames.
+        ///
+        /// This is separate from `hasAnimations` because the render thread
+        /// has to be able to tell the two apart: `custom-shader-animation`
+        /// governs custom shaders only and must not gate cursor motion.
+        ///
+        /// This is called on the render thread outside the draw mutex (and
+        /// `drawFrame` may be on the app thread). It reads only the atomic
+        /// pending flag, which draw-owned animation state publishes after
+        /// every target update and sample.
+        pub fn cursorMotionActive(self: *const Self) bool {
+            return self.cursor_motion_active.load(.acquire);
+        }
+
+        pub fn inputMotionActive(self: *const Self) bool {
+            return self.input_motion_active.load(.acquire);
+        }
+
+        fn reduceMotion(self: *const Self, input: bool) bool {
+            const respect = if (input)
+                self.config.input_motion_respect_reduce_motion
+            else
+                self.config.cursor_motion_respect_reduce_motion;
+            if (!respect) return false;
+            if (comptime builtin.os.tag == .macos) {
+                return os.macos.accessibilityDisplayShouldReduceMotion();
+            }
+            return false;
+        }
+
+        /// The cursor animation clock, in milliseconds since
+        /// `cursor_motion.epoch`. Returns 0 before the clock has started,
+        /// at which point nothing can be animating anyway.
+        fn cursorMotionTime(self: *const Self) f32 {
+            const epoch = self.cursor_motion.epoch orelse return 0;
+            const now: std.Io.Timestamp = .now(global.io(), .awake);
+
+            // We go through f64 because the nanosecond count is well past
+            // what f32 can hold exactly.
+            const ns: f64 = @floatFromInt(epoch.durationTo(now).nanoseconds);
+            return @floatCast(ns / std.time.ns_per_ms);
+        }
+
+        /// Like `cursorMotionTime`, but restarts the clock first if the
+        /// animation is idle.
+        ///
+        /// Rebasing while idle is always safe (nothing holds a timestamp
+        /// across it) and it's what keeps the `f32` values we hand the
+        /// animation small enough to stay exact, no matter how long the
+        /// process has been running.
+        ///
+        /// Caller must hold the draw mutex.
+        fn cursorMotionTimeStart(self: *Self) f32 {
+            const state: *CursorMotionState = &self.cursor_motion;
+
+            if (state.epoch != null) {
+                const ms = self.cursorMotionTime();
+                if (state.anim.isActive(ms)) return ms;
+            }
+
+            state.epoch = .now(global.io(), .awake);
+
+            // Park the animation on its target so that its stored
+            // timestamps agree with the clock we just restarted.
+            state.anim.snap(state.anim.target);
+            return 0;
         }
 
         /// True if our renderer is using vsync. If true, the renderer or apprt
@@ -1022,6 +1342,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Flag that we need to update our custom shaders
             self.custom_shader_focused_changed = true;
+
+            // Focus changes swap the cursor between solid and hollow and
+            // stop the blink, so an animation across the change would be
+            // nonsense. Snap instead.
+            self.draw_mutex.lockUncancelable(global.io());
+            self.cursor_motion.snap = true;
+            self.clearInputMotion();
+            self.draw_mutex.unlock(global.io());
+            self.cursor_motion_active.store(false, .release);
 
             self.syncDisplayLink(null, null);
         }
@@ -1124,6 +1453,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Update relevant uniforms
             self.updateFontGridUniforms();
 
+            // The cursor rect is derived from the cell size, so a font
+            // change moves and resizes it for reasons that have nothing to
+            // do with the cursor. Snap rather than animate that.
+            self.cursor_motion.snap = true;
+
             // Force a full rebuild, because cached rows may still reference
             // an outdated atlas from the old grid and this can cause garbage
             // to be rendered.
@@ -1174,6 +1508,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 links: terminal.RenderState.CellSet,
                 mouse: renderer.State.Mouse,
                 preedit: ?renderer.State.Preedit,
+                /// A locally encoded intent is only consumed alongside a
+                /// dirty terminal snapshot. The later cell-diff matcher may
+                /// reject it; in that case no output animation is emitted.
+                input_intent: ?inputmotion.Event,
+                screen_generation: usize,
+                semantic_output: bool,
                 scrollbar: terminal.Scrollbar,
                 overlay_features: []const Overlay.Feature,
             };
@@ -1248,6 +1588,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     break :preedit try p.clone(arena_alloc);
                 };
 
+                // Do not drain intent merely because a frame happened. The
+                // cell-diff matcher consumes it only after confirming a
+                // local-echo-shaped change; until then it remains queued.
+                state.input_motion.dropExpired(.now(global.io(), .awake));
+                const input_intent = if (self.terminal_state.dirty == .false)
+                    null
+                else
+                    state.input_motion.peek();
+
                 // If we have Kitty graphics data, we enter a SLOW SLOW SLOW path.
                 // We only do this if the Kitty image state is dirty meaning only if
                 // it changes.
@@ -1301,6 +1650,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .links = links,
                     .mouse = state.mouse,
                     .preedit = preedit,
+                    .input_intent = input_intent,
+                    .screen_generation = state.terminal.screens.generation(state.terminal.screens.active_key),
+                    .semantic_output = state.terminal.screens.active.cursor.semantic_content == .output,
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
                 };
@@ -1373,6 +1725,30 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // From this point forward no more errors.
             errdefer comptime unreachable;
 
+            // Resolve the intent while no draw lock is held. updateFrame's
+            // normal ordering is State -> draw; preserving it here avoids a
+            // lock inversion with Surface's input path.
+            const clear_input_motion = critical.preedit != null or self.terminal_state.dirty == .full;
+            const input_glyph_start: ?inputmotion.Event = if (clear_input_motion or
+                !self.config.input_motion or self.config.input_motion_intensity == 0 or self.reduceMotion(true))
+            barrier: {
+                // A preedit/full redraw changes the input contract rather
+                // than merely delaying echo. Discard every pending intent.
+                state.mutex.lockUncancelable(global.io());
+                defer state.mutex.unlock(global.io());
+                state.input_motion.reset();
+                break :barrier null;
+            } else if (critical.input_intent) |event| switch (event.kind) {
+                .text => self.resolveInputGlyphIntent(state, event, false, false, critical.screen_generation),
+                .delete => self.resolveInputDecayIntent(state, event, critical.screen_generation),
+                .commit => self.resolveInputCommitIntent(
+                    state,
+                    event,
+                    critical.screen_generation,
+                    critical.semantic_output,
+                ),
+            } else null;
+
             // Reset our dirty state after updating.
             defer self.terminal_state.dirty = .false;
 
@@ -1393,6 +1769,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 defer self.draw_mutex.unlock(global.io());
 
                 // Build our GPU cells
+                if (clear_input_motion) self.clearInputMotion();
+                if (input_glyph_start) |event| switch (event.kind) {
+                    .text => self.startInputGlyphMotion(event),
+                    .delete => self.startInputDecayMotion(event),
+                    .commit => self.startInputCommitMotion(event),
+                };
                 self.rebuildCells(
                     critical.preedit,
                     renderer.cursorStyle(&self.terminal_state, .{
@@ -1463,6 +1845,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // data we access while we're in the middle of drawing.
             self.draw_mutex.lockUncancelable(global.io());
             defer self.draw_mutex.unlock(global.io());
+
+            self.cancelMotionForReduceMotion();
 
             // After the graphics API is complete (so we defer) we want to
             // update our scrollbar state.
@@ -1542,6 +1926,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // If our stored size doesn't match the
             // surface size we need to update it.
             if (size_changed) {
+                self.clearInputMotion();
                 self.size.screen = .{
                     .width = surface_size.width,
                     .height = surface_size.height,
@@ -1570,6 +1955,30 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Upload the background image to the GPU as necessary.
             try self.uploadBackgroundImage();
 
+            // Sample the animated cursor before the custom shader uniforms.
+            // The latter intentionally sees the semantic target instead of
+            // every intermediate rect (see cursorPixelRect), but sampling
+            // here publishes whether another animation frame is needed.
+            const cursor_quads = self.sampleCursorMotion();
+            const input_glyph = self.sampleInputGlyphMotion();
+            const input_decay = self.sampleInputDecayMotion();
+            const input_commit = self.sampleInputCommitMotion();
+            var input_quads: InputGlyphQuads = .{};
+            var input_animating = false;
+            if (input_glyph) |glyph| {
+                input_quads.append(glyph.quad);
+                input_animating = glyph.active;
+            }
+            if (input_decay) |decay| {
+                input_quads.appendSlice(decay.quads[0..decay.len]);
+                input_animating = true;
+            }
+            if (input_commit) |commit| {
+                input_quads.appendSlice(commit.quads[0..commit.len]);
+                input_animating = true;
+            }
+            self.input_motion_active.store(input_animating, .release);
+
             // Update per-frame custom shader uniforms.
             try self.updateCustomShaderUniformsForFrame();
 
@@ -1577,6 +1986,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             try frame.uniforms.sync(&.{self.uniforms});
             try frame.cells_bg.sync(self.cells.bg_cells);
             const fg_count = try frame.cells.syncFromArrayLists(self.cells.fg_rows);
+            if (cursor_quads.len > 0) {
+                try frame.cursor.sync(cursor_quads.quads[0..cursor_quads.len]);
+            }
+            if (input_quads.len > 0) try frame.input_glyph.sync(input_quads.quads[0..input_quads.len]);
 
             // If our background image buffer has changed, sync it.
             if (frame.bg_image_buffer_modified != self.bg_image_buffer_modified) {
@@ -1670,6 +2083,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .kitty_below_text,
                 );
 
+                // The animated cursor, when it belongs beneath the text.
+                // This mirrors `Contents.setCursor` putting the block
+                // cursor in the fg row that draws before the text.
+                if (cursor_quads.len > 0 and !cursor_quads.over_text) {
+                    self.drawCursorQuads(&pass, frame, cursor_quads);
+                }
+
                 // Text.
                 pass.step(.{
                     .pipeline = self.shaders.pipelines.cell_text,
@@ -1688,6 +2108,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         .instance_count = fg_count,
                     },
                 });
+
+                // The one confirmed local echo rises above normal text. Its
+                // corresponding CellText instance was withheld in addGlyph.
+                if (input_quads.len > 0) pass.step(.{
+                    .pipeline = self.shaders.pipelines.input_glyph,
+                    .uniforms = frame.uniforms.buffer,
+                    .buffers = &.{ frame.input_glyph.buffer, frame.cells_bg.buffer },
+                    .textures = &.{ frame.grayscale, frame.color },
+                    .draw = .{ .type = .triangle_strip, .vertex_count = 4, .instance_count = input_quads.len },
+                });
+
+                // The animated cursor, when it belongs on top of the text:
+                // hollow, bar, underline, and lock. This mirrors
+                // `Contents.setCursor` putting those in the fg row that
+                // draws after the text.
+                if (cursor_quads.len > 0 and cursor_quads.over_text) {
+                    self.drawCursorQuads(&pass, frame, cursor_quads);
+                }
 
                 // Kitty images in front of text.
                 self.images.draw(
@@ -1736,6 +2174,569 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     });
                 }
             }
+        }
+
+        /// Sample the cursor motion animation for this frame and build the
+        /// quads to draw for it. Returns an empty result when cursor motion
+        /// is disabled or the cursor isn't currently visible.
+        ///
+        /// Caller must hold the draw mutex.
+        fn sampleCursorMotion(self: *Self) CursorQuads {
+            if (self.config.cursor_motion == .none) return .{};
+
+            const state: *CursorMotionState = &self.cursor_motion;
+            const head = state.head orelse {
+                // Nothing to draw, and nothing to schedule frames for.
+                state.pending = false;
+                self.cursor_motion_active.store(false, .release);
+                return .{};
+            };
+
+            // Note this also restarts the clock and parks the animation if
+            // we've settled, so the sample below lands exactly on target.
+            const now = self.cursorMotionTimeStart();
+            const sample = state.anim.sample(now);
+
+            // Remember whether we're still in flight. This is what keeps
+            // the draw pump running, and it stays true through the frame on
+            // which the animation ends so that we always present the
+            // resting position rather than stopping a fraction short.
+            state.pending = state.anim.isActive(now);
+            self.cursor_motion_active.store(state.pending, .release);
+            state.last_rect = sample.rect;
+
+            // A free-floating block cursor is not over any one grid cell,
+            // so keep cell-text inversion disabled while it is moving. The
+            // final resting/snap frame restores the legacy cursor-text color
+            // at the destination without requiring another terminal rebuild.
+            if (cursorTextInversionTarget(
+                state.block_text_target,
+                state.pending,
+            )) |target| {
+                self.uniforms.cursor_pos = target.pos;
+                self.uniforms.bools.cursor_wide = target.wide;
+            }
+
+            var result: CursorQuads = .{ .over_text = state.over_text };
+
+            // The trail goes first so that the cursor draws over it.
+            if (sample.trail != null) trail: {
+                const glyph = state.trail orelse break :trail;
+                // `trail` is the conservative axis-aligned bounds; the
+                // actual drawing uses this directional line. A sample from
+                // an older/restored state without one simply has no trail.
+                const line = sample.trail_line orelse break :trail;
+                const dx = line.to[0] - line.from[0];
+                const dy = line.to[1] - line.from[1];
+                const length = std.math.hypot(dx, dy);
+                if (length < 1.0) break :trail;
+                const basis_x: [2]f32 = .{ dx / length, dy / length };
+                const basis_y: [2]f32 = .{ -basis_x[1], basis_x[0] };
+
+                // Fold the trail's fade into the cursor alpha. The shader
+                // premultiplies from this byte, so scaling it here is the
+                // correct way to fade a premultiplied color.
+                const alpha: u8 = @intFromFloat(@round(
+                    @as(f32, @floatFromInt(head.color[3])) *
+                        std.math.clamp(sample.trail_alpha, 0.0, 1.0),
+                ));
+                if (alpha == 0) break :trail;
+
+                result.quads[result.len] = .{
+                    .pos = .{
+                        line.from[0] - (basis_y[0] * line.thickness / 2),
+                        line.from[1] - (basis_y[1] * line.thickness / 2),
+                    },
+                    .size = .{ length, line.thickness },
+                    .basis_x = basis_x,
+                    .basis_y = basis_y,
+                    .glyph_pos = glyph.pos,
+                    .glyph_size = glyph.size,
+                    .color = .{
+                        head.color[0],
+                        head.color[1],
+                        head.color[2],
+                        alpha,
+                    },
+                };
+                result.len += 1;
+            }
+
+            result.quads[result.len] = .{
+                .pos = sample.rect.pos,
+                .size = sample.rect.size,
+                .basis_x = .{ 1, 0 },
+                .basis_y = .{ 0, 1 },
+                .glyph_pos = head.glyph.pos,
+                .glyph_size = head.glyph.size,
+                .color = head.color,
+            };
+            result.len += 1;
+
+            return result;
+        }
+
+        /// Issue the draw step for the animated cursor quads. The caller is
+        /// responsible for checking `quads.len` and for calling this at the
+        /// right point relative to the text, per `quads.over_text`.
+        fn drawCursorQuads(
+            self: *const Self,
+            pass: *RenderPass,
+            frame: *const FrameState,
+            quads: CursorQuads,
+        ) void {
+            pass.step(.{
+                .pipeline = self.shaders.pipelines.cursor,
+                .uniforms = frame.uniforms.buffer,
+                .buffers = &.{frame.cursor.buffer},
+                .textures = &.{frame.grayscale},
+                .draw = .{
+                    .type = .triangle_strip,
+                    .vertex_count = 4,
+                    .instance_count = quads.len,
+                },
+            });
+        }
+
+        /// Start only the narrowest possible local-echo shape: one scalar at
+        /// the recorded cursor, echoed in that exact cell, with the terminal
+        /// cursor advanced by its grid width. Anything else is output (or a
+        /// terminal rewrite) and is intentionally never animated.
+        fn resolveInputGlyphIntent(
+            self: *Self,
+            shared: *renderer.State,
+            event: inputmotion.Event,
+            preedit: bool,
+            rebuild: bool,
+            screen_generation: usize,
+        ) ?inputmotion.Event {
+            const reject = struct {
+                fn run(shared_: *renderer.State, generation: u64) void {
+                    shared_.mutex.lockUncancelable(global.io());
+                    defer shared_.mutex.unlock(global.io());
+                    _ = shared_.input_motion.takeIfGeneration(generation);
+                }
+            }.run;
+            if (preedit or rebuild or event.kind != .text or event.scalar_len != 1) {
+                shared.mutex.lockUncancelable(global.io());
+                defer shared.mutex.unlock(global.io());
+                shared.input_motion.reset();
+                return null;
+            }
+            const state = &self.terminal_state;
+            if (event.source_row >= state.rows or event.source_col >= state.cols or
+                @intFromEnum(state.screen) != event.screen or
+                event.screen_generation != screen_generation)
+            {
+                reject(shared, event.generation);
+                return null;
+            }
+            const row = state.row_data.items(.cells)[event.source_row];
+            const cell = row.get(event.source_col).raw;
+            const cursor = state.cursor.viewport orelse {
+                reject(shared, event.generation);
+                return null;
+            };
+            const width = cell.gridWidth();
+            if (!inputmotion.matchesSingleScalar(
+                event,
+                cell.codepoint(),
+                cursor.x,
+                cursor.y,
+                width,
+            )) {
+                // This dirty snapshot is not the echo we were waiting for;
+                // drop it rather than allowing a stale key to block later
+                // local input indefinitely.
+                reject(shared, event.generation);
+                return null;
+            }
+
+            // Only one changed row, and it must be the source row, can
+            // plausibly be this local echo. Multiple dirty rows means scroll,
+            // redraw, or concurrent output: conservatively reject it.
+            const dirty_rows = blk: {
+                var count: usize = 0;
+                for (state.row_data.items(.dirty)) |dirty| {
+                    if (dirty) count += 1;
+                }
+                break :blk count;
+            };
+            if (dirty_rows != 1 or !state.row_data.items(.dirty)[event.source_row]) {
+                reject(shared, event.generation);
+                return null;
+            }
+            shared.mutex.lockUncancelable(global.io());
+            defer shared.mutex.unlock(global.io());
+            if (shared.input_motion.takeIfGeneration(event.generation) == null) return null;
+            return event;
+        }
+
+        /// Confirm a backward delete only after the terminal snapshot has
+        /// completed. This rejects all output-like rewrites and retains the
+        /// old text sprite from the parallel text-only cache before the row
+        /// clear in rebuildCells can destroy it.
+        fn resolveInputDecayIntent(
+            self: *Self,
+            shared: *renderer.State,
+            event: inputmotion.Event,
+            screen_generation: usize,
+        ) ?inputmotion.Event {
+            const reject = struct {
+                fn run(shared_: *renderer.State, generation: u64) void {
+                    shared_.mutex.lockUncancelable(global.io());
+                    defer shared_.mutex.unlock(global.io());
+                    _ = shared_.input_motion.takeIfGeneration(generation);
+                }
+            }.run;
+            const state = &self.terminal_state;
+            if (event.source_row >= state.rows or event.target_col >= state.cols or
+                @intFromEnum(state.screen) != event.screen or
+                event.screen_generation != screen_generation or
+                event.source_col == 0)
+            {
+                reject(shared, event.generation);
+                return null;
+            }
+            const cursor = state.cursor.viewport orelse {
+                reject(shared, event.generation);
+                return null;
+            };
+            const cell = state.row_data.items(.cells)[event.source_row].get(event.target_col).raw;
+            if (!inputmotion.matchesBackwardDelete(
+                event,
+                @intCast(@intFromEnum(state.screen)),
+                cell.codepoint(),
+                cursor.x,
+                cursor.y,
+            )) {
+                reject(shared, event.generation);
+                return null;
+            }
+            var dirty_rows: usize = 0;
+            for (state.row_data.items(.dirty)) |dirty| {
+                if (dirty) dirty_rows += 1;
+            }
+            if (dirty_rows != 1 or !state.row_data.items(.dirty)[event.source_row]) {
+                reject(shared, event.generation);
+                return null;
+            }
+            shared.mutex.lockUncancelable(global.io());
+            defer shared.mutex.unlock(global.io());
+            if (shared.input_motion.takeIfGeneration(event.generation) == null) return null;
+            return event;
+        }
+
+        /// A commit is not a cursor/newline heuristic. It is emitted only
+        /// when an Enter accepted in OSC 133 B later observes OSC 133 C on
+        /// the same screen generation. Shells can put the linefeed in the
+        /// terminal before C, hence the deliberately tiny retry window.
+        fn resolveInputCommitIntent(
+            self: *Self,
+            shared: *renderer.State,
+            event: inputmotion.Event,
+            screen_generation: usize,
+            semantic_output: bool,
+        ) ?inputmotion.Event {
+            const state = &self.terminal_state;
+            const same_screen = @intFromEnum(state.screen) == event.screen;
+            if (inputmotion.matchesSemanticCommit(
+                event,
+                @intCast(@intFromEnum(state.screen)),
+                screen_generation,
+                semantic_output,
+            )) {
+                // The input row must still be visible and must not be a
+                // broad redraw. This makes the cached text-row snapshot a
+                // safe source for a transient overlay.
+                if (event.source_row >= state.rows or
+                    state.dirty == .full or
+                    self.cells.text_rows.len <= event.source_row)
+                {
+                    shared.mutex.lockUncancelable(global.io());
+                    defer shared.mutex.unlock(global.io());
+                    _ = shared.input_motion.takeIfGeneration(event.generation);
+                    return null;
+                }
+                shared.mutex.lockUncancelable(global.io());
+                defer shared.mutex.unlock(global.io());
+                if (shared.input_motion.takeIfGeneration(event.generation) == null) return null;
+                return event;
+            }
+
+            shared.mutex.lockUncancelable(global.io());
+            defer shared.mutex.unlock(global.io());
+            // A screen/generation barrier is terminal output, never a delayed
+            // semantic command transition. Drop it immediately. Otherwise
+            // retain just three dirty snapshots for the common LF -> OSC C
+            // ordering, then expire and unblock newer input.
+            if (!same_screen or event.screen_generation != screen_generation) {
+                _ = shared.input_motion.takeIfGeneration(event.generation);
+                return null;
+            }
+            _ = shared.input_motion.retryCommitIfGeneration(event.generation);
+            return null;
+        }
+
+        /// Caller holds draw_mutex. This is deliberately separate from
+        /// resolveInputGlyphIntent so it never reaches for State.mutex.
+        fn startInputGlyphMotion(self: *Self, event: inputmotion.Event) void {
+            self.input_glyph_motion = .{
+                .start = .now(global.io(), .awake),
+                .generation = event.generation,
+                .row = event.source_row,
+                .col = event.source_col,
+            };
+            self.input_motion_active.store(true, .release);
+        }
+
+        const InputGlyphQuads = struct {
+            quads: [inputmotion.max_overlay_quads]shaderpkg.InputGlyphQuad = undefined,
+            len: usize = 0,
+
+            fn append(self: *InputGlyphQuads, quad: shaderpkg.InputGlyphQuad) void {
+                assert(self.len < self.quads.len);
+                self.quads[self.len] = quad;
+                self.len += 1;
+            }
+
+            fn appendSlice(self: *InputGlyphQuads, quads: []const shaderpkg.InputGlyphQuad) void {
+                assert(self.len + quads.len <= self.quads.len);
+                @memcpy(self.quads[self.len .. self.len + quads.len], quads);
+                self.len += quads.len;
+            }
+        };
+
+        const SampledInputGlyph = struct {
+            quad: shaderpkg.InputGlyphQuad,
+            active: bool,
+        };
+
+        /// Returns the frame-local animated quad. Rise is 5px -> 0px over
+        /// the configured duration using cubic ease-out.
+        fn sampleInputGlyphMotion(self: *Self) ?SampledInputGlyph {
+            const motion = &(self.input_glyph_motion orelse return null);
+            var quad = motion.quad orelse return null;
+            if (motion.force_static) {
+                quad.opacity = 255;
+                return .{ .quad = quad, .active = false };
+            }
+            const now = std.Io.Timestamp.now(global.io(), .awake);
+            const elapsed: f64 = @floatFromInt(motion.start.durationTo(now).nanoseconds);
+            const elapsed_ms: f32 = @floatCast(elapsed / std.time.ns_per_ms);
+            const duration: f32 = @floatFromInt(self.config.input_motion_duration);
+            const t: f32 = if (duration == 0) 1 else std.math.clamp(elapsed_ms / duration, 0.0, 1.0);
+            const p = inputmotion.riseProgressScaled(elapsed_ms, duration);
+            quad.pos[1] += 5.0 * self.config.input_motion_intensity * (1.0 - p);
+            // Intensity controls how visible the arrival is, not the final
+            // glyph. At rest the held overlay is fully opaque so it remains
+            // visually identical until ordinary CellText replaces it.
+            quad.opacity = @intFromFloat(255.0 * (1.0 - self.config.input_motion_intensity * (1.0 - p)));
+            return .{ .quad = quad, .active = t < 1.0 };
+        }
+
+        /// Retain one old glyph and render a small deterministic fan of
+        /// shrinking/rising afterimages. The fixed five-instance budget is
+        /// enough to read as a restrained shatter without per-key allocation.
+        fn startInputDecayMotion(self: *Self, event: inputmotion.Event) void {
+            const glyph = self.cells.textGlyph(event.source_row, event.target_col) orelse return;
+            const cell_width: f32 = @floatFromInt(self.grid_metrics.cell_width);
+            const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
+            self.input_decay_motion = .{
+                .quad = .{
+                    .pos = .{
+                        @as(f32, @floatFromInt(event.target_col)) * cell_width + @as(f32, @floatFromInt(glyph.bearings[0])),
+                        @as(f32, @floatFromInt(event.source_row)) * cell_height + cell_height - @as(f32, @floatFromInt(glyph.bearings[1])),
+                    },
+                    .glyph_pos = glyph.glyph_pos,
+                    .glyph_size = glyph.glyph_size,
+                    .grid_pos = glyph.grid_pos,
+                    .color = glyph.color,
+                    .atlas = glyph.atlas,
+                    .bools = .{ .no_min_contrast = glyph.bools.no_min_contrast },
+                    .draw_size = .{
+                        @floatFromInt(glyph.glyph_size[0]),
+                        @floatFromInt(glyph.glyph_size[1]),
+                    },
+                },
+                .start = .now(global.io(), .awake),
+            };
+            self.input_motion_active.store(true, .release);
+        }
+
+        /// Snapshot text-only sprites before rebuildCells clears the prior
+        /// input row. Normal committed text is rebuilt underneath; these
+        /// copies drift upward by a few pixels and fade as a restrained carry.
+        fn startInputCommitMotion(self: *Self, event: inputmotion.Event) void {
+            if (event.source_row >= self.cells.text_rows.len) return;
+            const cell_width: f32 = @floatFromInt(self.grid_metrics.cell_width);
+            const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
+            var motion: @TypeOf(self.input_commit_motion.?) = undefined;
+            motion.len = 0;
+            for (self.cells.text_rows[event.source_row].items) |glyph| {
+                const x = glyph.grid_pos[0];
+                if (x < event.input_col_start or x >= event.input_col_end) continue;
+                if (motion.len == motion.quads.len) break;
+                motion.quads[motion.len] = .{
+                    .pos = .{
+                        @as(f32, @floatFromInt(x)) * cell_width + @as(f32, @floatFromInt(glyph.bearings[0])),
+                        @as(f32, @floatFromInt(event.source_row)) * cell_height + cell_height - @as(f32, @floatFromInt(glyph.bearings[1])),
+                    },
+                    .glyph_pos = glyph.glyph_pos,
+                    .glyph_size = glyph.glyph_size,
+                    .grid_pos = glyph.grid_pos,
+                    .color = glyph.color,
+                    .atlas = glyph.atlas,
+                    .bools = .{ .no_min_contrast = glyph.bools.no_min_contrast },
+                    .opacity = 255,
+                    .draw_size = .{
+                        @floatFromInt(glyph.glyph_size[0]),
+                        @floatFromInt(glyph.glyph_size[1]),
+                    },
+                };
+                motion.len += 1;
+            }
+            if (motion.len == 0) return;
+            motion.start = .now(global.io(), .awake);
+            self.input_commit_motion = motion;
+            self.input_motion_active.store(true, .release);
+        }
+
+        const DecayGlyphQuads = struct {
+            quads: [inputmotion.decay_quad_count]shaderpkg.InputGlyphQuad,
+            len: usize,
+        };
+
+        fn sampleInputDecayMotion(self: *Self) ?DecayGlyphQuads {
+            const motion = &(self.input_decay_motion orelse return null);
+            const now = std.Io.Timestamp.now(global.io(), .awake);
+            const elapsed: f64 = @floatFromInt(motion.start.durationTo(now).nanoseconds);
+            const duration: f32 = @floatFromInt(self.config.input_motion_duration);
+            const p = inputmotion.decayProgressScaled(@floatCast(elapsed / std.time.ns_per_ms), duration * 1.2);
+            if (p >= 1.0) {
+                self.input_decay_motion = null;
+                return null;
+            }
+            var result: DecayGlyphQuads = undefined;
+            // Head plus four fixed afterimages. Their offsets are intentionally
+            // deterministic so deletion is stable and free of RNG state.
+            const offsets: [inputmotion.decay_quad_count][2]f32 = .{ .{ 0, 0 }, .{ -1.6, -2.2 }, .{ 1.3, -3.6 }, .{ -2.7, -5.2 }, .{ 2.5, -6.8 } };
+            for (offsets, 0..) |offset, i| {
+                var quad = motion.quad;
+                const age = std.math.clamp(p + @as(f32, @floatFromInt(i)) * 0.10, 0.0, 1.0);
+                const scale = 1.0 - 0.42 * age * self.config.input_motion_intensity;
+                quad.pos[0] += offset[0] * p * self.config.input_motion_intensity;
+                quad.pos[1] -= (7.0 + offset[1]) * p * self.config.input_motion_intensity;
+                quad.draw_size = .{
+                    @max(1.0, quad.draw_size[0] * scale),
+                    @max(1.0, quad.draw_size[1] * scale),
+                };
+                const afterimage_alpha: f32 = if (i == 0) 1.0 else 0.38;
+                quad.opacity = @intFromFloat(255.0 * (1.0 - age) * afterimage_alpha * self.config.input_motion_intensity);
+                result.quads[i] = quad;
+            }
+            result.len = offsets.len;
+            return result;
+        }
+
+        const CommitGlyphQuads = struct {
+            quads: [inputmotion.commit_quad_count]shaderpkg.InputGlyphQuad,
+            len: usize,
+        };
+
+        fn sampleInputCommitMotion(self: *Self) ?CommitGlyphQuads {
+            const motion = &(self.input_commit_motion orelse return null);
+            const now = std.Io.Timestamp.now(global.io(), .awake);
+            const elapsed: f64 = @floatFromInt(motion.start.durationTo(now).nanoseconds);
+            const elapsed_ms: f32 = @floatCast(elapsed / std.time.ns_per_ms);
+            const duration: f32 = @floatFromInt(self.config.input_motion_duration);
+            const p = inputmotion.commitProgressScaled(elapsed_ms, duration * 1.4);
+            if (p >= 1.0) {
+                self.input_commit_motion = null;
+                return null;
+            }
+            var result: CommitGlyphQuads = .{ .quads = undefined, .len = motion.len };
+            for (motion.quads[0..motion.len], 0..) |base, i| {
+                var quad = base;
+                // A slight stagger makes the carry read left-to-right without
+                // obscuring the stable committed row below it.
+                const stagger = @as(f32, @floatFromInt(i % 6)) * 0.035;
+                const age = std.math.clamp((p - stagger) / (1.0 - stagger), 0.0, 1.0);
+                quad.pos[1] -= 4.0 * age * self.config.input_motion_intensity;
+                quad.pos[0] += @as(f32, @floatFromInt(@as(i32, @intCast(i % 3)) - 1)) * 0.45 * age * self.config.input_motion_intensity;
+                quad.opacity = @intFromFloat(96.0 * (1.0 - age) * self.config.input_motion_intensity);
+                result.quads[i] = quad;
+            }
+            return result;
+        }
+
+        /// Caller holds draw_mutex. Full redraw, resize, focus and config
+        /// changes invalidate pixel-space overlay anchors.
+        fn clearInputMotion(self: *Self) void {
+            self.input_glyph_motion = null;
+            self.input_decay_motion = null;
+            self.input_commit_motion = null;
+            self.input_motion_active.store(false, .release);
+        }
+
+        /// Stop visual motion without dropping the sole rendering of a
+        /// withheld typed cell. Decay/commit overlays are afterimages over
+        /// normally rebuilt text and can be removed immediately.
+        fn freezeTypedInputMotion(self: *Self) void {
+            var visual_changed = self.input_decay_motion != null or
+                self.input_commit_motion != null;
+            if (self.input_glyph_motion) |*motion| {
+                if (inputmotion.retainTypedOverlayAfterCancellation(motion.quad != null)) {
+                    visual_changed = visual_changed or !motion.force_static;
+                    motion.force_static = true;
+                } else {
+                    self.input_glyph_motion = null;
+                }
+            }
+            self.input_decay_motion = null;
+            self.input_commit_motion = null;
+            self.input_motion_active.store(false, .release);
+            // Cancellation runs before drawFrame's early-out decision. Make
+            // sure the final static glyph/removal is actually presented even
+            // when no terminal cells changed in this frame.
+            if (visual_changed) self.cells_rebuilt = true;
+        }
+
+        /// Draw-owned, immediate accessibility cancellation. This runs before
+        /// deciding whether the current frame needs redrawing, so a runtime
+        /// macOS Reduce Motion toggle cannot leave a floating caret or input
+        /// overlay on screen. The saved legacy cell restores block inversion
+        /// and normal cursor layering in the same frame.
+        fn cancelMotionForReduceMotion(self: *Self) void {
+            if (self.reduceMotion(true)) self.freezeTypedInputMotion();
+            if (!self.reduceMotion(false)) return;
+
+            const state = &self.cursor_motion;
+            // `legacy_cell` is a retained sprite, not proof that the cursor
+            // is currently visible: blink-off, preedit, or an off-viewport
+            // cursor clears `head`. Never resurrect a stale hidden cursor.
+            if (state.head != null) if (state.legacy_cell) |cell| {
+                self.cells.setCursor(cell, state.legacy_style);
+                if (state.block_text_target) |target| {
+                    self.uniforms.cursor_pos = target.pos;
+                    self.uniforms.bools.cursor_wide = target.wide;
+                } else {
+                    self.uniforms.cursor_pos = .{
+                        std.math.maxInt(u16),
+                        std.math.maxInt(u16),
+                    };
+                    self.uniforms.bools.cursor_wide = false;
+                }
+                self.cells_rebuilt = true;
+            };
+            state.head = null;
+            state.legacy_cell = null;
+            state.legacy_style = null;
+            state.trail = null;
+            state.block_text_target = null;
+            state.pending = false;
+            state.snap = true;
+            self.cursor_motion_active.store(false, .release);
         }
 
         // Callback from the graphics API when a frame is completed.
@@ -1911,6 +2912,30 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             self.config.deinit();
             self.config = config.*;
+
+            // Apply the new cursor motion settings. Note that switching to
+            // `none` needs no teardown: the `markDirty` below forces a full
+            // rebuild, which puts the cursor back into the cell_text
+            // pipeline, so it can't vanish. Switching the other way is the
+            // same in reverse.
+            if (cursorMotionStyle(config.cursor_motion)) |style| {
+                self.cursor_motion.anim.setStyle(style);
+            }
+            self.cursor_motion.anim.setDuration(
+                @floatFromInt(config.cursor_motion_duration),
+            );
+            self.cursor_motion.head = null;
+            self.cursor_motion.snap = true;
+            self.cursor_motion_active.store(false, .release);
+            // Config reload normally forces a rebuild immediately. Retain a
+            // withheld typed glyph statically until that rebuild, even if a
+            // runtime caller observes the new disabled/zero-intensity state
+            // before it can run.
+            if (!config.input_motion or config.input_motion_intensity == 0) {
+                self.freezeTypedInputMotion();
+            } else {
+                self.clearInputMotion();
+            }
 
             // If our background image path changed, prepare the new bg image.
             if (bg_image_changed) try self.prepBackgroundImage();
@@ -2146,7 +3171,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             const screen = self.size.screen;
             const padding = self.size.padding;
-            const cell = self.size.cell;
 
             uniforms.resolution = .{
                 @floatFromInt(screen.width),
@@ -2160,55 +3184,31 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 0,
             };
 
-            if (self.cells.getCursorGlyph()) |cursor| {
-                const cursor_width: f32 = @floatFromInt(cursor.glyph_size[0]);
-                const cursor_height: f32 = @floatFromInt(cursor.glyph_size[1]);
+            if (self.cursorPixelRect()) |cursor| {
+                // `cursor.rect` is in the renderer's native top-left pixel
+                // space, relative to the top-left of the grid. Custom
+                // shaders want it relative to the top-left of the screen,
+                // so we add the window padding back in. Note the rect
+                // already has the glyph bearings folded into it.
+                const pixel_x: f32 =
+                    cursor.rect.pos[0] + @as(f32, @floatFromInt(padding.left));
+                const top: f32 =
+                    cursor.rect.pos[1] + @as(f32, @floatFromInt(padding.top));
 
-                // Left edge of the cell the cursor is in.
-                var pixel_x: f32 = @floatFromInt(
-                    cursor.grid_pos[0] * cell.width + padding.left,
-                );
-                // Top edge, relative to the top of the
-                // screen, of the cell the cursor is in.
-                var pixel_y: f32 = @floatFromInt(
-                    cursor.grid_pos[1] * cell.height + padding.top,
-                );
-
-                // If +Y is up in our shaders, we need to flip the coordinate
-                // so that it's instead the top edge of the cell relative to
-                // the *bottom* of the screen.
-                if (!GraphicsAPI.custom_shader_y_is_down) {
-                    pixel_y = @as(f32, @floatFromInt(screen.height)) - pixel_y;
-                }
-
-                // Add the X bearing to get the -X (left) edge of the cursor.
-                pixel_x += @floatFromInt(cursor.bearings[0]);
-
-                // How we deal with the Y bearing depends on which direction
-                // is "up", since we want our final `pixel_y` value to be the
-                // +Y edge of the cursor.
-                if (GraphicsAPI.custom_shader_y_is_down) {
-                    // As a reminder, the Y bearing is the distance from the
-                    // bottom of the cell to the top of the glyph, so to get
-                    // the +Y edge we need to add the cell height, subtract
-                    // the Y bearing, and add the glyph height to get the +Y
-                    // (bottom) edge of the cursor.
-                    pixel_y += @floatFromInt(cell.height);
-                    pixel_y -= @floatFromInt(cursor.bearings[1]);
-                    pixel_y += @floatFromInt(cursor.glyph_size[1]);
-                } else {
-                    // If the Y direction is reversed though, we instead want
-                    // the *top* edge of the cursor, which means we just need
-                    // to subtract the cell height and add the Y bearing.
-                    pixel_y -= @floatFromInt(cell.height);
-                    pixel_y += @floatFromInt(cursor.bearings[1]);
-                }
+                // Custom shaders want the +Y edge of the cursor. If +Y is
+                // down that's the bottom edge measured from the top of the
+                // screen; if +Y is up it's the top edge measured from the
+                // *bottom* of the screen.
+                const pixel_y: f32 = if (GraphicsAPI.custom_shader_y_is_down)
+                    top + cursor.rect.size[1]
+                else
+                    @as(f32, @floatFromInt(screen.height)) - top;
 
                 const new_cursor: [4]f32 = .{
                     pixel_x,
                     pixel_y,
-                    cursor_width,
-                    cursor_height,
+                    cursor.rect.size[0],
+                    cursor.rect.size[1],
                 };
                 const cursor_color: [4]f32 = .{
                     @as(f32, @floatFromInt(cursor.color[0])) / 255.0,
@@ -2242,6 +3242,37 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 uniforms.time_focus = uniforms.time;
                 self.custom_shader_focused_changed = false;
             }
+        }
+
+        /// The rect and color of the cursor as it will be drawn this frame,
+        /// in the renderer's native top-left pixel space (relative to the
+        /// top-left of the grid, before the projection matrix applies the
+        /// window padding). Null if no cursor is being drawn.
+        ///
+        /// With cursor motion enabled the cursor is no longer in the cell
+        /// buffer. Custom shaders deliberately receive the semantic target,
+        /// not the in-between animated rect: otherwise every animation
+        /// sample looks like a new cursor change and perpetually resets
+        /// `cursor_change_time` (breaking shader ripples/aging effects).
+        ///
+        /// Caller must hold the draw mutex.
+        fn cursorPixelRect(self: *Self) ?struct {
+            rect: motionpkg.Rect,
+            color: [4]u8,
+        } {
+            if (self.config.cursor_motion != .none and !self.reduceMotion(false)) {
+                const head = self.cursor_motion.head orelse return null;
+                return .{
+                    .rect = self.cursor_motion.anim.target,
+                    .color = head.color,
+                };
+            }
+
+            const cursor = self.cells.getCursorGlyph() orelse return null;
+            return .{
+                .rect = cursorCellRect(cursor, self.grid_metrics),
+                .color = cursor.color,
+            };
         }
 
         /// Build the overlay as configured. Returns null if there is no
@@ -2334,15 +3365,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 new_size.rows = state.rows;
                 new_size.columns = state.cols;
                 try self.cells.resize(self.alloc, new_size);
+                self.clearInputMotion();
 
                 // Update our uniforms accordingly, otherwise
                 // our background cells will be out of place.
                 self.uniforms.grid_size = .{ new_size.columns, new_size.rows };
+
+                // A reflow moves the cursor for reasons that have nothing
+                // to do with the cursor, so snap rather than animate.
+                self.cursor_motion.snap = true;
             }
 
             const rebuild = state.dirty == .full or grid_size_diff;
             if (rebuild) {
+                // See Queue.reset: a full grid replacement has no safe
+                // cursor anchor for a local input event.
                 // If we are doing a full rebuild, then we clear the entire cell buffer.
+                self.clearInputMotion();
                 self.cells.reset();
 
                 // We also reset our padding extension depending on the screen type
@@ -2373,6 +3412,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const row_dirty = row_data.items(.dirty);
             const row_selection = row_data.items(.selection);
             const row_highlights = row_data.items(.highlights);
+
+            // Any subsequent rebuild of the target row replaces the held
+            // overlay with ordinary cell text. A full rebuild/resize is a
+            // hard barrier.
+            if (self.input_glyph_motion) |motion| {
+                if (motion.quad != null and
+                    (rebuild or (motion.row < row_dirty.len and row_dirty[motion.row])))
+                {
+                    self.input_glyph_motion = null;
+                }
+            }
 
             // If our cell contents buffer is shorter than the screen viewport,
             // we render the rows that fit, starting from the bottom. If instead
@@ -2447,6 +3497,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
             }
 
+            // If the shaped run did not yield a glyph at the anchored cell
+            // (ligature/replacement/zero-width cases), nothing was withheld
+            // from CellText. Cancel rather than leaving the draw timer live.
+            if (self.input_glyph_motion) |motion| {
+                if (inputmotion.cancelAfterRebuild(motion.quad != null)) {
+                    self.input_glyph_motion = null;
+                }
+            }
+
             // Setup our cursor rendering information.
             cursor: {
                 // Clear our cursor by default.
@@ -2455,6 +3514,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     std.math.maxInt(u16),
                     std.math.maxInt(u16),
                 };
+
+                // Clear the animated cursor too. If it wasn't visible on
+                // the previous pass either, then it's coming back from
+                // being hidden and must snap into place rather than fly in
+                // from wherever it was left.
+                if (self.config.cursor_motion != .none) {
+                    if (self.cursor_motion.head == null) {
+                        self.cursor_motion.snap = true;
+                    }
+                    self.cursor_motion.head = null;
+                    self.cursor_motion.legacy_cell = null;
+                    self.cursor_motion.legacy_style = null;
+                    self.cursor_motion.trail = null;
+                    self.cursor_motion.block_text_target = null;
+                    self.cursor_motion_active.store(false, .release);
+                }
 
                 // If the cursor isn't visible on the viewport, don't show
                 // a cursor. Otherwise, get our cursor cell, because we may
@@ -2521,25 +3596,30 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     cursor_color,
                 );
 
-                // If the cursor is visible then we set our uniforms.
+                // If the cursor is visible then we set our uniforms. Animated
+                // block cursors defer their text inversion to
+                // `sampleCursorMotion`: while in transit there is no target
+                // cell to recolor, and the sampled resting frame restores it.
                 if (style == .block) {
                     const wide = state.cursor.cell.wide;
 
-                    self.uniforms.cursor_pos = .{
-                        // If we are a spacer tail of a wide cell, our cursor needs
-                        // to move back one cell. The saturate is to ensure we don't
-                        // overflow but this shouldn't happen with well-formed input.
-                        switch (wide) {
-                            .narrow, .spacer_head, .wide => cursor_vp.x,
-                            .spacer_tail => cursor_vp.x -| 1,
-                        },
-                        @intCast(cursor_vp.y),
-                    };
+                    if (self.config.cursor_motion == .none or self.reduceMotion(false)) {
+                        self.uniforms.cursor_pos = .{
+                            // If we are a spacer tail of a wide cell, our cursor needs
+                            // to move back one cell. The saturate is to ensure we don't
+                            // overflow but this shouldn't happen with well-formed input.
+                            switch (wide) {
+                                .narrow, .spacer_head, .wide => cursor_vp.x,
+                                .spacer_tail => cursor_vp.x -| 1,
+                            },
+                            @intCast(cursor_vp.y),
+                        };
 
-                    self.uniforms.bools.cursor_wide = switch (wide) {
-                        .narrow, .spacer_head => false,
-                        .wide, .spacer_tail => true,
-                    };
+                        self.uniforms.bools.cursor_wide = switch (wide) {
+                            .narrow, .spacer_head => false,
+                            .wide, .spacer_tail => true,
+                        };
+                    }
 
                     const uniform_color = if (self.config.cursor_text) |txt| blk: {
                         // If cursor-text is set, then compute the correct color.
@@ -3209,7 +4289,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 return;
             }
 
-            try self.cells.add(self.alloc, .text, .{
+            const text_cell: shaderpkg.CellText = .{
                 .atlas = switch (render.presentation) {
                     .emoji => .color,
                     .text => .grayscale,
@@ -3223,7 +4303,45 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(render.glyph.offset_x + shaper_cell.x_offset),
                     @intCast(render.glyph.offset_y + shaper_cell.y_offset),
                 },
-            });
+            };
+
+            // The exact confirmed local echo is drawn by the free-floating
+            // input pipeline for its whole arrival. Do not also put this
+            // instance in cell_text: two overlapping glyph masks would make
+            // the supposed fade begin at full darkness.
+            if (self.input_glyph_motion) |*motion| {
+                if (motion.quad == null and motion.col == x and motion.row == y) {
+                    const cell_width: f32 = @floatFromInt(self.grid_metrics.cell_width);
+                    const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
+                    motion.quad = .{
+                        .pos = .{
+                            @as(f32, @floatFromInt(x)) * cell_width + @as(f32, @floatFromInt(render.glyph.offset_x + shaper_cell.x_offset)),
+                            @as(f32, @floatFromInt(y)) * cell_height + cell_height - @as(f32, @floatFromInt(render.glyph.offset_y + shaper_cell.y_offset)),
+                        },
+                        .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
+                        .glyph_size = .{ render.glyph.width, render.glyph.height },
+                        .grid_pos = .{ x, y },
+                        .color = .{ color.r, color.g, color.b, alpha },
+                        .atlas = switch (render.presentation) {
+                            .emoji => .color,
+                            .text => .grayscale,
+                        },
+                        .bools = .{ .no_min_contrast = noMinContrast(cp) },
+                        .opacity = 255,
+                        .draw_size = .{
+                            @floatFromInt(render.glyph.width),
+                            @floatFromInt(render.glyph.height),
+                        },
+                    };
+                    // Keep the real text sprite independently of fg_rows:
+                    // an immediate Backspace can arrive before this held
+                    // arrival glyph has ever been rebuilt into normal text.
+                    try self.cells.cacheText(self.alloc, text_cell);
+                    return;
+                }
+            }
+
+            try self.cells.add(self.alloc, .text, text_cell);
         }
 
         fn addCursor(
@@ -3301,7 +4419,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 },
             };
 
-            self.cells.setCursor(.{
+            const cell: shaderpkg.CellText = .{
                 .atlas = .grayscale,
                 .bools = .{ .is_cursor_glyph = true },
                 .grid_pos = .{ x, cursor_vp.y },
@@ -3312,7 +4430,109 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(render.glyph.offset_x),
                     @intCast(render.glyph.offset_y),
                 },
-            }, cursor_style);
+            };
+
+            // With cursor motion enabled the cursor leaves the shared
+            // cell_text pipeline and becomes its own free-floating quad,
+            // which is what lets it sit part way between two cells. Note
+            // everything above this point is unchanged either way, so both
+            // paths agree on the sprite, the color, and the alpha.
+            if (self.config.cursor_motion != .none and !self.reduceMotion(false)) {
+                self.setCursorMotionTarget(cell, cursor_style, wide);
+                return;
+            }
+
+            self.cells.setCursor(cell, cursor_style);
+        }
+
+        /// Aim the cursor motion animation at the cell the cursor now
+        /// occupies. `cell` is exactly the instance the legacy path would
+        /// have handed to `cell.Contents.setCursor`.
+        ///
+        /// Caller must hold the draw mutex.
+        fn setCursorMotionTarget(
+            self: *Self,
+            cell: shaderpkg.CellText,
+            style: renderer.CursorStyle,
+            wide: bool,
+        ) void {
+            const state: *CursorMotionState = &self.cursor_motion;
+
+            state.legacy_cell = cell;
+            state.legacy_style = style;
+
+            state.head = .{
+                .glyph = .{
+                    .pos = cell.glyph_pos,
+                    .size = cell.glyph_size,
+                },
+                .color = cell.color,
+            };
+
+            // Match the z-order the cell_text pipeline gives the cursor:
+            // block cursors under the text, everything else over it. This
+            // mirrors the switch in `cell.Contents.setCursor`.
+            state.over_text = switch (style) {
+                .block => false,
+                .block_hollow, .bar, .underline, .lock => true,
+            };
+            state.block_text_target = if (style == .block) .{
+                .pos = cell.grid_pos,
+                .wide = wide,
+            } else null;
+
+            // The trail quad is drawn with the solid block sprite so that
+            // it reads as a streak no matter what shape the cursor itself
+            // is. Only the styles that can produce a trail need it.
+            state.trail = switch (self.config.cursor_motion) {
+                .spring, .smear => self.cursorTrailGlyph(),
+                .none, .ease, .squash => null,
+            };
+
+            const rect = cursorCellRect(cell, self.grid_metrics);
+
+            if (state.snap) {
+                state.snap = false;
+                state.anim.snap(rect);
+                self.cursor_motion_active.store(false, .release);
+                return;
+            }
+
+            // Handing the animation the same rect it already has is a
+            // no-op, so this is safe to call on every rebuild.
+            const now = self.cursorMotionTimeStart();
+            state.anim.setTarget(rect, now);
+            self.cursor_motion_active.store(state.anim.isActive(now), .release);
+        }
+
+        /// The solid block cursor sprite, used to draw the trail quad.
+        ///
+        /// This is a cached atlas lookup rather than a rasterization on all
+        /// but the first call for a given cell size, the same as the cursor
+        /// sprite that `addCursor` fetches.
+        ///
+        /// Caller must hold the draw mutex.
+        fn cursorTrailGlyph(self: *Self) ?CursorMotionState.Glyph {
+            const render = self.font_grid.renderGlyph(
+                self.alloc,
+                font.sprite_index,
+                @intFromEnum(font.Sprite.cursor_rect),
+                .{
+                    // Always one cell wide: the sprite is a solid rect, and
+                    // it gets stretched to the trail rect regardless, so a
+                    // wide cursor doesn't need its own atlas entry.
+                    .cell_width = 1,
+                    .grid_metrics = self.grid_metrics,
+                },
+            ) catch |err| {
+                log.warn("error rendering cursor trail glyph err={}", .{err});
+                return null;
+            };
+
+            return .{
+                .pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
+                .size = .{ render.glyph.width, render.glyph.height },
+            };
         }
 
         fn addPreeditCell(
@@ -3376,4 +4596,92 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             try texture.replaceRegion(0, 0, atlas.size, atlas.size, atlas.data);
         }
     };
+}
+
+test "cursor motion style mapping" {
+    const testing = std.testing;
+
+    // `none` means disabled, everything else has a 1:1 animation style.
+    try testing.expect(cursorMotionStyle(.none) == null);
+    try testing.expectEqual(motionpkg.Style.ease, cursorMotionStyle(.ease).?);
+    try testing.expectEqual(motionpkg.Style.spring, cursorMotionStyle(.spring).?);
+    try testing.expectEqual(motionpkg.Style.smear, cursorMotionStyle(.smear).?);
+    try testing.expectEqual(motionpkg.Style.squash, cursorMotionStyle(.squash).?);
+}
+
+test "cursor motion block text inversion waits for arrival" {
+    const testing = std.testing;
+    const target: CursorTextTarget = .{
+        .pos = .{ 12, 4 },
+        .wide = true,
+    };
+
+    // A free-floating cursor has no one cell to invert.
+    try testing.expect(cursorTextInversionTarget(target, true) == null);
+
+    // Snaps and settled animations immediately recover legacy behavior.
+    try testing.expectEqual(target, cursorTextInversionTarget(target, false).?);
+    try testing.expect(cursorTextInversionTarget(null, false) == null);
+}
+
+test "cursor rect matches the cell_text bearing math" {
+    const testing = std.testing;
+
+    // Only the cell dimensions are consulted.
+    var metrics: font.Metrics = undefined;
+    metrics.cell_width = 10;
+    metrics.cell_height = 20;
+
+    // A block cursor fills its cell: the Y bearing is the full cell
+    // height, so the glyph top is flush with the cell top.
+    {
+        const rect = cursorCellRect(.{
+            .grid_pos = [2]u16{ 3, 4 },
+            .bearings = [2]i16{ 0, 20 },
+            .glyph_size = [2]u32{ 10, 20 },
+        }, metrics);
+        try testing.expectEqual(@as(f32, 30), rect.pos[0]);
+        try testing.expectEqual(@as(f32, 80), rect.pos[1]);
+        try testing.expectEqual(@as(f32, 10), rect.size[0]);
+        try testing.expectEqual(@as(f32, 20), rect.size[1]);
+    }
+
+    // A bar cursor is narrow and inset from the left of the cell by its
+    // X bearing.
+    {
+        const rect = cursorCellRect(.{
+            .grid_pos = [2]u16{ 1, 0 },
+            .bearings = [2]i16{ 1, 20 },
+            .glyph_size = [2]u32{ 2, 20 },
+        }, metrics);
+        try testing.expectEqual(@as(f32, 11), rect.pos[0]);
+        try testing.expectEqual(@as(f32, 0), rect.pos[1]);
+        try testing.expectEqual(@as(f32, 2), rect.size[0]);
+        try testing.expectEqual(@as(f32, 20), rect.size[1]);
+    }
+
+    // An underline cursor sits near the bottom of the cell, which is
+    // `cell_height - bearing_y` below the cell top.
+    {
+        const rect = cursorCellRect(.{
+            .grid_pos = [2]u16{ 0, 1 },
+            .bearings = [2]i16{ 0, 3 },
+            .glyph_size = [2]u32{ 10, 3 },
+        }, metrics);
+        try testing.expectEqual(@as(f32, 0), rect.pos[0]);
+        try testing.expectEqual(@as(f32, 37), rect.pos[1]);
+        try testing.expectEqual(@as(f32, 3), rect.size[1]);
+    }
+
+    // A wide cursor needs no special handling: `addCursor` rasterizes the
+    // sprite two cells wide, so the width is already in the glyph size.
+    {
+        const rect = cursorCellRect(.{
+            .grid_pos = [2]u16{ 2, 0 },
+            .bearings = [2]i16{ 0, 20 },
+            .glyph_size = [2]u32{ 20, 20 },
+        }, metrics);
+        try testing.expectEqual(@as(f32, 20), rect.pos[0]);
+        try testing.expectEqual(@as(f32, 20), rect.size[0]);
+    }
 }

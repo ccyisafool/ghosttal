@@ -19,40 +19,17 @@ enum AppIcon: Equatable, Codable, Sendable {
 #if !DOCK_TILE_PLUGIN
     init?(config: Ghostty.Config) {
         switch config.macosIcon {
-        case .official:
+        // Stock Ghostty icon styles must not replace Ghosttal's identity when
+        // they are inherited from a user's Ghostty configuration.
+        case .official, .blueprint, .chalkboard, .glass, .holographic,
+             .microchip, .paper, .retro, .xray, .customStyle:
             return nil
-        case .blueprint:
-            self = .blueprint
-        case .chalkboard:
-            self = .chalkboard
-        case .glass:
-            self = .glass
-        case .holographic:
-            self = .holographic
-        case .microchip:
-            self = .microchip
-        case .paper:
-            self = .paper
-        case .retro:
-            self = .retro
-        case .xray:
-            self = .xray
         case .custom:
             if let data = try? Data(contentsOf: URL(filePath: config.macosCustomIcon, relativeTo: nil)) {
                 self = .custom(data)
             } else {
                 return nil
             }
-        case .customStyle:
-            // Discard saved icon name
-            // if no valid colours were found
-            guard
-                let ghostColor = config.macosIconGhostColor,
-                let screenColors = config.macosIconScreenColor
-            else {
-                return nil
-            }
-            self = .customStyle(ColorizedGhosttyIcon(screenColors: screenColors, ghostColor: ghostColor, frame: config.macosIconFrame))
         }
     }
 #endif

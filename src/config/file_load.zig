@@ -7,6 +7,8 @@ const global = @import("../global.zig");
 
 const log = std.log.scoped(.config);
 
+const ghostty_bundle_id = "com.mitchellh.ghostty";
+
 /// Default path for the XDG home configuration file. Returned value
 /// must be freed by the caller.
 pub fn defaultXdgPath(alloc: Allocator) ![]const u8 {
@@ -30,6 +32,30 @@ pub fn legacyDefaultXdgPath(alloc: Allocator) ![]const u8 {
         alloc,
         &environ_map,
         .{ .subdir = "ghostty/config" },
+    );
+}
+
+/// Ghosttal overlay path. The stock Ghostty path remains the base layer.
+pub fn ghosttalDefaultXdgPath(alloc: Allocator) ![]const u8 {
+    var environ_map = try global.environMap();
+    defer environ_map.deinit();
+    return try internal_os.xdg.config(
+        global.io(),
+        alloc,
+        &environ_map,
+        .{ .subdir = "ghosttal/config.ghostty" },
+    );
+}
+
+/// Legacy-style Ghosttal overlay path.
+pub fn ghosttalLegacyDefaultXdgPath(alloc: Allocator) ![]const u8 {
+    var environ_map = try global.environMap();
+    defer environ_map.deinit();
+    return try internal_os.xdg.config(
+        global.io(),
+        alloc,
+        &environ_map,
+        .{ .subdir = "ghosttal/config" },
     );
 }
 
@@ -70,6 +96,24 @@ pub fn legacyDefaultAppSupportPath(alloc: Allocator) ![]const u8 {
     return try internal_os.macos.appSupportDir(alloc, "config");
 }
 
+/// Stock Ghostty Application Support config, loaded as Ghosttal's base layer.
+pub fn ghosttyDefaultAppSupportPath(alloc: Allocator) ![]const u8 {
+    return try internal_os.macos.appSupportDirForBundle(
+        alloc,
+        ghostty_bundle_id,
+        "config.ghostty",
+    );
+}
+
+/// Stock Ghostty legacy Application Support config.
+pub fn ghosttyLegacyDefaultAppSupportPath(alloc: Allocator) ![]const u8 {
+    return try internal_os.macos.appSupportDirForBundle(
+        alloc,
+        ghostty_bundle_id,
+        "config",
+    );
+}
+
 /// Preferred default path for the macOS Application Support configuration file.
 /// Returned value must be freed by the caller.
 pub fn preferredAppSupportPath(alloc: Allocator) ![]const u8 {
@@ -105,14 +149,13 @@ pub fn preferredAppSupportPath(alloc: Allocator) ![]const u8 {
 pub fn preferredDefaultFilePath(alloc: Allocator) ![]const u8 {
     switch (builtin.os.tag) {
         .macos => {
-            // macOS prefers the Application Support directory
-            // if it exists.
+            // Ghosttal's App Support overlay is preferred for editing.
             const app_support_path = try preferredAppSupportPath(alloc);
             const app_support_file = open(global.io(), app_support_path) catch {
-                // Try the XDG path if it exists
-                const xdg_path = try preferredXdgPath(alloc);
+                // Try Ghosttal's XDG overlay if it exists.
+                const xdg_path = try ghosttalPreferredXdgPath(alloc);
                 const xdg_file = open(global.io(), xdg_path) catch {
-                    // If neither file exists, use app support
+                    // If neither overlay exists, create/use App Support.
                     alloc.free(xdg_path);
                     return app_support_path;
                 };
@@ -124,9 +167,29 @@ pub fn preferredDefaultFilePath(alloc: Allocator) ![]const u8 {
             return app_support_path;
         },
 
-        // All other platforms use XDG only
-        else => return try preferredXdgPath(alloc),
+        // All other platforms edit the Ghosttal overlay, never Ghostty's base.
+        else => return try ghosttalPreferredXdgPath(alloc),
     }
+}
+
+/// Preferred Ghosttal XDG overlay path.
+pub fn ghosttalPreferredXdgPath(alloc: Allocator) ![]const u8 {
+    const xdg_path = try ghosttalDefaultXdgPath(alloc);
+    if (open(global.io(), xdg_path)) |f| {
+        f.close(global.io());
+        return xdg_path;
+    } else |_| {}
+
+    errdefer alloc.free(xdg_path);
+    const legacy_xdg_path = try ghosttalLegacyDefaultXdgPath(alloc);
+    if (open(global.io(), legacy_xdg_path)) |f| {
+        f.close(global.io());
+        alloc.free(xdg_path);
+        return legacy_xdg_path;
+    } else |_| {}
+
+    alloc.free(legacy_xdg_path);
+    return xdg_path;
 }
 
 const OpenFileError = error{
