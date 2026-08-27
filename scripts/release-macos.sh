@@ -20,7 +20,23 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for command_name in zig nu xcodebuild codesign hdiutil xcrun lipo rsync; do
+retry() {
+  local max_attempts="$1"
+  shift
+  local attempt=1
+
+  until "$@"; do
+    if (( attempt >= max_attempts )); then
+      return 1
+    fi
+
+    echo "Command failed; retrying (${attempt}/${max_attempts}): $*" >&2
+    sleep 30
+    ((attempt += 1))
+  done
+}
+
+for command_name in zig nu xcodebuild codesign hdiutil xcrun lipo rsync ditto; do
   command -v "${command_name}" >/dev/null || {
     echo "Missing required command: ${command_name}" >&2
     exit 1
@@ -62,7 +78,7 @@ readonly APP_ARCHS="$(lipo -archs "${APP_PATH}/Contents/MacOS/ghosttal")"
   exit 1
 }
 
-codesign --force --deep --options runtime --timestamp \
+retry 20 codesign --force --deep --options runtime --timestamp \
   --entitlements "${STAGE_ROOT}/macos/Ghostty.entitlements" \
   --sign "${SIGNING_IDENTITY}" \
   "${APP_PATH}"
@@ -74,17 +90,17 @@ hdiutil create \
   -format UDZO \
   -ov \
   "${STAGED_DMG}"
-codesign --force --timestamp --sign "${SIGNING_IDENTITY}" "${STAGED_DMG}"
+retry 20 codesign --force --timestamp --sign "${SIGNING_IDENTITY}" "${STAGED_DMG}"
 codesign --verify --verbose=2 "${STAGED_DMG}"
 
 xcrun notarytool submit "${STAGED_DMG}" \
   --keychain-profile "${NOTARY_PROFILE}" \
   --wait
-xcrun stapler staple "${STAGED_DMG}"
+retry 20 xcrun stapler staple "${STAGED_DMG}"
 xcrun stapler validate "${STAGED_DMG}"
 spctl --assess --type open --context context:primary-signature --verbose=2 "${STAGED_DMG}"
 
-cp "${STAGED_DMG}" "${OUTPUT_DIR}/${DMG_NAME}"
+ditto --rsrc --extattr "${STAGED_DMG}" "${OUTPUT_DIR}/${DMG_NAME}"
 
 echo "Release ready: ${OUTPUT_DIR}/${DMG_NAME}"
 echo "Architectures: ${APP_ARCHS}"

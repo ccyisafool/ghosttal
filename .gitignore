@@ -3,6 +3,7 @@
 .swp
 *.log
 .DS_Store
+._*
 .vscode/
 .direnv/
 .envrc.local
