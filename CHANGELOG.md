@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1
+
+- Add an Applications shortcut to the macOS installer DMG.
+
 ## 0.1.0
 
 - Add GPU-rendered cursor motion modes: ease, spring, smear, and squash.

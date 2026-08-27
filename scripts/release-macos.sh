@@ -3,7 +3,7 @@
 set -euo pipefail
 
 readonly SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-readonly RELEASE_VERSION="${RELEASE_VERSION:-0.1.0}"
+readonly RELEASE_VERSION="${RELEASE_VERSION:-0.1.1}"
 readonly SIGNING_IDENTITY="${SIGNING_IDENTITY:-Developer ID Application: Chenyang Cheng (Y63C8FW5ZK)}"
 readonly NOTARY_PROFILE="${NOTARY_PROFILE:-ghosttal-notary}"
 readonly OUTPUT_DIR="${OUTPUT_DIR:-${SOURCE_ROOT}/dist}"
@@ -11,9 +11,13 @@ readonly TEMP_ROOT="$(mktemp -d "${TMPDIR:-/private/tmp}/ghosttal-release.XXXXXX
 readonly STAGE_ROOT="${TEMP_ROOT}/source"
 readonly APP_PATH="${STAGE_ROOT}/macos/build/Release/Ghosttal.app"
 readonly DMG_NAME="Ghosttal-${RELEASE_VERSION}-universal.dmg"
+readonly DMG_SOURCE="${TEMP_ROOT}/dmg"
+readonly DMG_MOUNT="${TEMP_ROOT}/mount"
 readonly STAGED_DMG="${TEMP_ROOT}/${DMG_NAME}"
 
 cleanup() {
+  hdiutil detach "${DMG_MOUNT}" >/dev/null 2>&1 || true
+
   if [[ "${TEMP_ROOT}" == /private/tmp/ghosttal-release.* || "${TEMP_ROOT}" == /tmp/ghosttal-release.* ]]; then
     rm -rf -- "${TEMP_ROOT}"
   fi
@@ -36,7 +40,7 @@ retry() {
   done
 }
 
-for command_name in zig nu xcodebuild codesign hdiutil xcrun lipo rsync ditto; do
+for command_name in zig nu xcodebuild codesign hdiutil xcrun lipo rsync ditto ln readlink; do
   command -v "${command_name}" >/dev/null || {
     echo "Missing required command: ${command_name}" >&2
     exit 1
@@ -84,12 +88,32 @@ retry 20 codesign --force --deep --options runtime --timestamp \
   "${APP_PATH}"
 codesign --verify --deep --strict --verbose=2 "${APP_PATH}"
 
+mkdir -p "${DMG_SOURCE}" "${DMG_MOUNT}"
+ditto --rsrc --extattr "${APP_PATH}" "${DMG_SOURCE}/Ghosttal.app"
+ln -s /Applications "${DMG_SOURCE}/Applications"
+
 hdiutil create \
   -volname Ghosttal \
-  -srcfolder "${APP_PATH}" \
+  -srcfolder "${DMG_SOURCE}" \
   -format UDZO \
   -ov \
   "${STAGED_DMG}"
+
+hdiutil attach \
+  -readonly \
+  -nobrowse \
+  -mountpoint "${DMG_MOUNT}" \
+  "${STAGED_DMG}"
+[[ -d "${DMG_MOUNT}/Ghosttal.app" ]] || {
+  echo "DMG is missing Ghosttal.app" >&2
+  exit 1
+}
+[[ -L "${DMG_MOUNT}/Applications" && "$(readlink "${DMG_MOUNT}/Applications")" == /Applications ]] || {
+  echo "DMG is missing the /Applications shortcut" >&2
+  exit 1
+}
+hdiutil detach "${DMG_MOUNT}"
+
 retry 20 codesign --force --timestamp --sign "${SIGNING_IDENTITY}" "${STAGED_DMG}"
 codesign --verify --verbose=2 "${STAGED_DMG}"
 
