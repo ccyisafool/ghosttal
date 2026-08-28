@@ -116,6 +116,7 @@ jobs:
           tar -xzf create-dmg.tar.gz -C "${RUNNER_TEMP}/create-dmg" --strip-components 1
           chmod +x "${RUNNER_TEMP}/create-dmg/create-dmg"
           echo "CREATE_DMG=${RUNNER_TEMP}/create-dmg/create-dmg" >> "${GITHUB_ENV}"
+          rm -f zig.tar.xz nu.tar.gz sparkle.tar.xz create-dmg.tar.gz
 
       - name: Import signing certificate
         env:

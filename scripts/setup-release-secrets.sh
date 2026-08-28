@@ -16,6 +16,7 @@
 set -euo pipefail
 
 readonly REPO="${REPO:-ccyisafool/ghosttal}"
+readonly ENVIRONMENT="${ENVIRONMENT:-release}"
 readonly SIGNING_IDENTITY="${SIGNING_IDENTITY:-Developer ID Application: Chenyang Cheng (Y63C8FW5ZK)}"
 readonly WORK_DIR="$(mktemp -d)"
 
@@ -30,7 +31,7 @@ for command_name in gh security base64; do
 done
 gh auth status >/dev/null || exit 1
 
-echo "Uploading secrets to ${REPO}."
+echo "Uploading secrets to ${REPO}'s ${ENVIRONMENT} environment."
 echo
 
 ## 1. Developer ID certificate ------------------------------------------------
@@ -51,8 +52,8 @@ echo
 readonly CERT_COPY="${WORK_DIR}/certificate.p12"
 cp -- "${CERT_PATH}" "${CERT_COPY}"
 chmod 600 "${CERT_COPY}"
-base64 -i "${CERT_COPY}" | gh secret set MACOS_CERTIFICATE_P12 -R "${REPO}"
-printf '%s' "${CERT_PASSWORD}" | gh secret set MACOS_CERTIFICATE_PASSWORD -R "${REPO}"
+base64 -i "${CERT_COPY}" | gh secret set MACOS_CERTIFICATE_P12 -R "${REPO}" --env "${ENVIRONMENT}"
+printf '%s' "${CERT_PASSWORD}" | gh secret set MACOS_CERTIFICATE_PASSWORD -R "${REPO}" --env "${ENVIRONMENT}"
 unset CERT_PASSWORD
 echo "Certificate uploaded; your original .p12 was left untouched."
 echo
@@ -66,7 +67,7 @@ SPARKLE_BIN="${SPARKLE_BIN:-$(find "${HOME}/Library/Developer/Xcode/DerivedData"
   exit 1
 }
 "${SPARKLE_BIN}/generate_keys" -x "${WORK_DIR}/sparkle-key"
-gh secret set SPARKLE_PRIVATE_KEY -R "${REPO}" < "${WORK_DIR}/sparkle-key"
+gh secret set SPARKLE_PRIVATE_KEY -R "${REPO}" --env "${ENVIRONMENT}" < "${WORK_DIR}/sparkle-key"
 echo "Sparkle key uploaded."
 echo
 
@@ -85,14 +86,14 @@ read -r -p "Issuer ID: " ASC_ISSUER_ID
   exit 1
 }
 
-gh secret set ASC_API_KEY_P8 -R "${REPO}" < "${ASC_KEY_PATH}"
-printf '%s' "${ASC_KEY_ID}" | gh secret set ASC_API_KEY_ID -R "${REPO}"
-printf '%s' "${ASC_ISSUER_ID}" | gh secret set ASC_API_ISSUER_ID -R "${REPO}"
+gh secret set ASC_API_KEY_P8 -R "${REPO}" --env "${ENVIRONMENT}" < "${ASC_KEY_PATH}"
+printf '%s' "${ASC_KEY_ID}" | gh secret set ASC_API_KEY_ID -R "${REPO}" --env "${ENVIRONMENT}"
+printf '%s' "${ASC_ISSUER_ID}" | gh secret set ASC_API_ISSUER_ID -R "${REPO}" --env "${ENVIRONMENT}"
 echo "Notary API key uploaded."
 echo
 
 echo "All six secrets are set:"
-gh secret list -R "${REPO}"
+gh secret list -R "${REPO}" --env "${ENVIRONMENT}"
 echo
 echo "Consider deleting the downloaded .p8 file (Apple lets you re-download it"
 echo "only once) after saving a copy in your password manager:"

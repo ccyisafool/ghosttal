@@ -58,6 +58,10 @@ command -v "${CREATE_DMG}" >/dev/null || {
   echo "create-dmg is unavailable; install it or set CREATE_DMG to its executable." >&2
   exit 1
 }
+xcodebuild -version >/dev/null 2>&1 || {
+  echo "A full Xcode installation must be selected with xcode-select." >&2
+  exit 1
+}
 
 [[ -z "$(git -C "${SOURCE_ROOT}" status --porcelain --untracked-files=all)" ]] || {
   echo "Release checkout must be clean, including untracked files." >&2
@@ -166,9 +170,9 @@ ditto --rsrc --extattr "${APP_PATH}" "${DMG_SOURCE}/Ghosttal.app"
   --window-pos 200 120 \
   --window-size 660 440 \
   --icon-size 112 \
-  --icon Ghosttal.app 165 278 \
+  --icon Ghosttal.app 136 255 \
   --hide-extension Ghosttal.app \
-  --app-drop-link 495 278 \
+  --app-drop-link 520 255 \
   --no-internet-enable \
   "${STAGED_DMG}" "${DMG_SOURCE}"
 
