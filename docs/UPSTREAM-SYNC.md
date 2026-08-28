@@ -50,7 +50,22 @@ zig build            # full app build
 Test-run the app manually (animations, config overlay, menu items), then
 merge the sync branch into `main`.
 
-## 2. Cut a Ghosttal release
+## 2. Cut a Ghosttal release (CI — the default)
+
+GitHub Actions releases from any machine, with no local signing setup:
+
+1. Bump versions and changelog exactly as in the manual flow below
+   (`project.pbxproj`, `scripts/release-macos.sh` default, `CHANGELOG.md`),
+   commit, and push `main`.
+2. `git tag vX.Y.Z && git push origin vX.Y.Z`
+
+That's all: `.github/workflows/release-ghosttal.yml` builds, signs,
+notarizes, publishes the GitHub release, and pushes the regenerated
+`appcast.xml` to `main` (pull after it finishes). It needs the six
+repository secrets uploaded once by `scripts/setup-release-secrets.sh`,
+run on a Mac that already has the certificate and Sparkle key.
+
+## 2b. Cut a Ghosttal release (manually, on a configured Mac)
 
 1. Bump versions — all in lockstep, or the release script refuses to run:
    - `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION` in

@@ -1,0 +1,142 @@
+## Ghosttal release: build, sign, notarize, publish, and update the appcast.
+##
+## Triggered by pushing a vX.Y.Z tag (or manually with a version whose tag
+## already exists). The tagged commit must already carry matching versions in
+## project.pbxproj and CHANGELOG.md — scripts/release-macos.sh enforces this.
+##
+## Secrets (Settings → Secrets and variables → Actions):
+##   MACOS_CERTIFICATE_P12      base64 of the Developer ID Application .p12
+##   MACOS_CERTIFICATE_PASSWORD password protecting the .p12
+##   ASC_API_KEY_P8             contents of the App Store Connect AuthKey .p8
+##   ASC_API_KEY_ID             the API key's Key ID
+##   ASC_API_ISSUER_ID          the API key's Issuer ID
+##   SPARKLE_PRIVATE_KEY        contents of the exported Sparkle EdDSA key
+##
+## scripts/setup-release-secrets.sh uploads all six from a configured Mac.
+
+name: Release Ghosttal
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (X.Y.Z; tag vX.Y.Z must exist)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - name: Resolve version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            VERSION="${INPUT_VERSION}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Invalid version: ${VERSION}" >&2
+            exit 1
+          }
+          echo "RELEASE_VERSION=${VERSION}" >> "${GITHUB_ENV}"
+
+      - name: Checkout release tag
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: v${{ env.RELEASE_VERSION }}
+
+      - name: Install Zig 0.16.0
+        run: |
+          curl -fsSL -o zig.tar.xz https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz
+          echo "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489  zig.tar.xz" | shasum -a 256 -c -
+          mkdir -p "${RUNNER_TEMP}/zig"
+          tar -xJf zig.tar.xz -C "${RUNNER_TEMP}/zig" --strip-components 1
+          rm zig.tar.xz
+          echo "${RUNNER_TEMP}/zig" >> "${GITHUB_PATH}"
+
+      - name: Install Nushell
+        run: brew install nushell
+
+      - name: Install Sparkle 2.9.0 tools
+        run: |
+          curl -fsSL -o sparkle.tar.xz https://github.com/sparkle-project/Sparkle/releases/download/2.9.0/Sparkle-2.9.0.tar.xz
+          echo "01e0f0ebf6614061ea816d414de50f937d64ffa6822ad572243031ca3676fe19  sparkle.tar.xz" | shasum -a 256 -c -
+          mkdir -p "${RUNNER_TEMP}/sparkle"
+          tar -xJf sparkle.tar.xz -C "${RUNNER_TEMP}/sparkle"
+          rm sparkle.tar.xz
+          echo "SPARKLE_BIN=${RUNNER_TEMP}/sparkle/bin" >> "${GITHUB_ENV}"
+
+      - name: Import signing certificate
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN="${RUNNER_TEMP}/release.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN}"
+          printf '%s' "${MACOS_CERTIFICATE_P12}" | base64 --decode > "${RUNNER_TEMP}/cert.p12"
+          security import "${RUNNER_TEMP}/cert.p12" -k "${KEYCHAIN}" \
+            -P "${MACOS_CERTIFICATE_PASSWORD}" -T /usr/bin/codesign
+          rm -f "${RUNNER_TEMP}/cert.p12"
+          security set-key-partition-list -S "apple-tool:,apple:" \
+            -s -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN}" >/dev/null
+          security list-keychains -d user -s "${KEYCHAIN}" login.keychain-db
+
+      - name: Write notary and Sparkle keys
+        env:
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          printf '%s' "${ASC_API_KEY_P8}" > "${RUNNER_TEMP}/asc-key.p8"
+          printf '%s' "${SPARKLE_PRIVATE_KEY}" > "${RUNNER_TEMP}/sparkle-key"
+          chmod 600 "${RUNNER_TEMP}/asc-key.p8" "${RUNNER_TEMP}/sparkle-key"
+          echo "NOTARY_KEY_FILE=${RUNNER_TEMP}/asc-key.p8" >> "${GITHUB_ENV}"
+          echo "SPARKLE_KEY_FILE=${RUNNER_TEMP}/sparkle-key" >> "${GITHUB_ENV}"
+
+      - name: Build, sign, and notarize
+        env:
+          NOTARY_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
+        run: ./scripts/release-macos.sh
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NOTES="$(sed -n "/^## ${RELEASE_VERSION//./\\.}/,/^## /p" CHANGELOG.md | sed '1d;$d')"
+          gh release create "v${RELEASE_VERSION}" \
+            "dist/Ghosttal-${RELEASE_VERSION}-universal.dmg" \
+            --title "Ghosttal ${RELEASE_VERSION}" \
+            --notes "${NOTES:-See CHANGELOG.md.}" \
+            --verify-tag
+
+      # Publish the appcast only after the release exists so shipped apps
+      # never see an enclosure URL that 404s.
+      - name: Push appcast to main
+        run: |
+          cp appcast.xml "${RUNNER_TEMP}/appcast.xml"
+          git checkout -- appcast.xml
+          git fetch origin main
+          git checkout -B main origin/main
+          cp "${RUNNER_TEMP}/appcast.xml" appcast.xml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add appcast.xml
+          git commit -m "release: publish appcast for v${RELEASE_VERSION}"
+          git push origin main
+
+      - name: Clean up keychain and keys
+        if: always()
+        run: |
+          security delete-keychain "${RUNNER_TEMP}/release.keychain-db" || true
+          rm -f "${RUNNER_TEMP}/asc-key.p8" "${RUNNER_TEMP}/sparkle-key" "${RUNNER_TEMP}/cert.p12"

@@ -50,23 +50,34 @@ for command_name in zig nu xcodebuild codesign hdiutil xcrun lipo rsync ditto ln
   }
 done
 
-# Notary credentials live in the data-protection keychain, so probe via
-# notarytool itself. Machines store the profile under different names.
-if [[ -z "${NOTARY_PROFILE:-}" ]]; then
-  for candidate in ghosttal-notary notarytool; do
-    if xcrun notarytool history --keychain-profile "${candidate}" >/dev/null 2>&1; then
-      NOTARY_PROFILE="${candidate}"
-      break
-    fi
-  done
-  [[ -n "${NOTARY_PROFILE:-}" ]] || {
-    echo "No notary credential profile found (tried: ghosttal-notary, notarytool)." >&2
-    echo "Run: xcrun notarytool store-credentials <profile> --apple-id <id> --team-id Y63C8FW5ZK" >&2
+# Notary credentials: prefer an App Store Connect API key when provided via
+# the environment (CI), otherwise probe the keychain credential profiles
+# that notarytool stores in the data-protection keychain (local machines).
+NOTARY_AUTH_ARGS=()
+if [[ -n "${NOTARY_KEY_FILE:-}" ]]; then
+  [[ -n "${NOTARY_KEY_ID:-}" && -n "${NOTARY_ISSUER_ID:-}" ]] || {
+    echo "NOTARY_KEY_FILE requires NOTARY_KEY_ID and NOTARY_ISSUER_ID." >&2
     exit 1
   }
+  NOTARY_AUTH_ARGS=(--key "${NOTARY_KEY_FILE}" --key-id "${NOTARY_KEY_ID}" --issuer "${NOTARY_ISSUER_ID}")
+  echo "Using notary App Store Connect API key: ${NOTARY_KEY_ID}"
+else
+  if [[ -z "${NOTARY_PROFILE:-}" ]]; then
+    for candidate in ghosttal-notary notarytool; do
+      if xcrun notarytool history --keychain-profile "${candidate}" >/dev/null 2>&1; then
+        NOTARY_PROFILE="${candidate}"
+        break
+      fi
+    done
+    [[ -n "${NOTARY_PROFILE:-}" ]] || {
+      echo "No notary credential profile found (tried: ghosttal-notary, notarytool)." >&2
+      echo "Run: xcrun notarytool store-credentials <profile> --apple-id <id> --team-id Y63C8FW5ZK" >&2
+      exit 1
+    }
+  fi
+  NOTARY_AUTH_ARGS=(--keychain-profile "${NOTARY_PROFILE}")
+  echo "Using notary profile: ${NOTARY_PROFILE}"
 fi
-readonly NOTARY_PROFILE
-echo "Using notary profile: ${NOTARY_PROFILE}"
 
 # Sparkle's CLI tools ship with the SPM artifact checkout.
 if [[ -z "${SPARKLE_BIN:-}" ]]; then
@@ -161,7 +172,7 @@ retry 20 codesign --force --timestamp --sign "${SIGNING_IDENTITY}" "${STAGED_DMG
 codesign --verify --verbose=2 "${STAGED_DMG}"
 
 xcrun notarytool submit "${STAGED_DMG}" \
-  --keychain-profile "${NOTARY_PROFILE}" \
+  "${NOTARY_AUTH_ARGS[@]}" \
   --wait
 retry 20 xcrun stapler staple "${STAGED_DMG}"
 xcrun stapler validate "${STAGED_DMG}"
@@ -171,7 +182,13 @@ ditto --rsrc --extattr "${STAGED_DMG}" "${OUTPUT_DIR}/${DMG_NAME}"
 
 # Sign the DMG with Ghosttal's Sparkle EdDSA key and regenerate the appcast
 # that shipped apps poll (served from the repository's main branch).
-ED_ATTRIBUTES="$("${SPARKLE_BIN}/sign_update" "${OUTPUT_DIR}/${DMG_NAME}")"
+# Sign with an explicit key file when provided (CI); otherwise the key in
+# the login keychain is used (local machines).
+if [[ -n "${SPARKLE_KEY_FILE:-}" ]]; then
+  ED_ATTRIBUTES="$("${SPARKLE_BIN}/sign_update" --ed-key-file "${SPARKLE_KEY_FILE}" "${OUTPUT_DIR}/${DMG_NAME}")"
+else
+  ED_ATTRIBUTES="$("${SPARKLE_BIN}/sign_update" "${OUTPUT_DIR}/${DMG_NAME}")"
+fi
 [[ "${ED_ATTRIBUTES}" == *sparkle:edSignature=* ]] || {
   echo "sign_update did not produce an EdDSA signature: ${ED_ATTRIBUTES}" >&2
   exit 1
