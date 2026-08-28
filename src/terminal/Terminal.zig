@@ -91,6 +91,12 @@ mouse_shape: mouse.Shape = .text,
 /// Per-session Glyph Protocol registrations.
 glyph_glossary: glyph.Glossary = .empty,
 
+/// Kitty drag and drop protocol (OSC 72) state. Allocated when a client
+/// registers to accept drops (t=a) and freed when it unregisters (t=A),
+/// so a terminal that never runs a drag and drop aware program pays
+/// nothing for it. Non-null means a client currently accepts drops.
+kitty_dnd: ?*kitty.dnd.State = null,
+
 /// These are just a packed set of flags we may set on the terminal.
 flags: packed struct {
     // This supports a Kitty extension where programs using semantic
@@ -353,6 +359,7 @@ pub fn deinit(self: *Terminal, alloc: Allocator) void {
     self.pwd.deinit(alloc);
     self.title.deinit(alloc);
     self.glyph_glossary.deinit(alloc);
+    if (self.kitty_dnd) |dnd| dnd.destroy(alloc);
     self.* = undefined;
 }
 
@@ -1323,14 +1330,21 @@ pub fn print(self: *Terminal, c: u21) !void {
                                 const old_rac = old_pin.rowAndCell();
 
                                 if (new_pin.node == old_pin.node) {
-                                    new_pin.node.page().moveGrapheme(prev.cell, new_rac.cell);
-                                    prev.cell.content_tag = .codepoint;
+                                    new_pin.node.page().moveGrapheme(old_rac.cell, new_rac.cell);
+                                    old_rac.cell.content_tag = .codepoint;
                                     new_rac.cell.content_tag = .codepoint_grapheme;
                                     new_rac.row.grapheme = true;
                                 } else {
                                     const cps = old_pin.node.page().lookupGrapheme(old_rac.cell).?;
                                     for (cps) |cp| {
-                                        try self.screens.active.appendGrapheme(new_rac.cell, cp);
+                                        // appendGrapheme can grow the cursor
+                                        // page, so read the destination from
+                                        // the cursor each time rather than
+                                        // holding a pointer across the call.
+                                        try self.screens.active.appendGrapheme(
+                                            self.screens.active.cursor.page_cell,
+                                            cp,
+                                        );
                                     }
                                     old_pin.node.page().clearGrapheme(old_rac.cell);
                                 }
@@ -1340,7 +1354,7 @@ pub fn print(self: *Terminal, c: u21) !void {
 
                             // Point prev.cell to our new previous cell that
                             // we'll be appending graphemes to
-                            prev.cell = new_rac.cell;
+                            prev.cell = self.screens.active.cursor.page_cell;
                         } else {
                             self.printCell(
                                 0,
@@ -1359,7 +1373,29 @@ pub fn print(self: *Terminal, c: u21) !void {
 
                     // Write our spacer, since prev.cell is now wide
                     self.screens.active.cursorRight(1);
+
+                    // Writing the spacer can grow the page to make room for
+                    // the cursor hyperlink. Growing replaces the page, which
+                    // invalidates `prev.cell`. Record the page identity first
+                    // so the common case where nothing grows stays free.
+                    //
+                    // A pointer comparison alone isn't enough: pages are
+                    // pooled, so a replacement can reuse the same address.
+                    // The serial makes the pair a unique identity.
+                    const spacer_node = self.screens.active.cursor.page_pin.node;
+                    const spacer_serial = spacer_node.serial;
+
                     self.printCell(0, .spacer_tail);
+
+                    if (self.screens.active.cursor.page_pin.node != spacer_node or
+                        self.screens.active.cursor.page_pin.node.serial != spacer_serial)
+                    {
+                        @branchHint(.unlikely);
+
+                        // The cursor is on the spacer tail we just wrote, so
+                        // the wide cell we append to is the one to its left.
+                        prev.cell = self.screens.active.cursorCellLeft(1);
+                    }
 
                     // Move the cursor again so we're beyond our spacer
                     if (self.screens.active.cursor.x == right_limit - 1) {
@@ -1704,7 +1740,11 @@ fn printCell(
         self.screens.active.cursorSetHyperlink() catch |err| {
             @branchHint(.unlikely);
             log.warn("error reallocating for more hyperlink space, ignoring hyperlink err={}", .{err});
-            assert(!cell.hyperlink);
+
+            // A partially successful grow can replace the page even when the
+            // call fails, so `cell` may be stale here. The cursor pointers are
+            // always reloaded, so read the cell through the cursor.
+            assert(!self.screens.active.cursor.page_cell.hyperlink);
         };
     } else if (had_hyperlink) {
         // If the previous cell had a hyperlink then we need to clear it.
@@ -3046,6 +3086,14 @@ pub fn insertLines(self: *Terminal, count: usize) void {
                 cur_row,
                 cells[self.scrolling_region.left .. self.scrolling_region.right + 1],
             );
+
+            // With a full-width scroll region the entire row is a
+            // fresh blank row: reset the metadata so nothing (wrap
+            // state, semantic prompt) is retained from the row whose
+            // storage it recycles. With left/right margins the row
+            // keeps content outside the margins so the metadata is
+            // preserved, matching the shift case above.
+            if (!left_right) cur_row.reset();
         }
 
         // Mark the row as dirty
@@ -3206,6 +3254,14 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
                 cur_row,
                 cells[self.scrolling_region.left .. self.scrolling_region.right + 1],
             );
+
+            // With a full-width scroll region the entire row is a
+            // fresh blank row: reset the metadata so nothing (wrap
+            // state, semantic prompt) is retained from the row whose
+            // storage it recycles. With left/right margins the row
+            // keeps content outside the margins so the metadata is
+            // preserved, matching the shift case above.
+            if (!left_right) cur_row.reset();
         }
 
         // Mark the row as dirty
@@ -4874,6 +4930,9 @@ pub fn fullReset(self: *Terminal) void {
     self.pwd.clearRetainingCapacity();
     self.title.clearRetainingCapacity();
     self.glyph_glossary.clearAndFree(self.gpa());
+    // A reset only interrupts an in-progress chunked OSC 72 command;
+    // drag and drop registration survives, matching kitty.
+    if (self.kitty_dnd) |dnd| dnd.chunking = .{};
     self.status_display = .main;
     self.scrolling_region = .{
         .top = 0,
@@ -6132,6 +6191,106 @@ test "Terminal: VS16 to make wide character on next line with hyperlink" {
     }
 }
 
+test "Terminal: VS16 widening when the spacer tail grows the page" {
+    // Regression test for a stale cell pointer in print's grapheme `.wide`
+    // path: writing the spacer tail can grow the page to fit the hyperlink,
+    // which replaces the page and invalidates the pointer to the wide cell.
+    var t = try init(testing.io, testing.allocator, .{ .rows = 10, .cols = 20 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.grapheme_cluster, true);
+    try t.screens.active.startHyperlink("http://example.com", null);
+
+    // Fill the page hyperlink map until a single slot is left. The '#' below
+    // takes that slot so the spacer tail is what forces the page to grow.
+    while (true) {
+        const page = t.screens.active.cursor.page_pin.node.page();
+        const map = page.hyperlink_map.map(page.memory);
+        if (map.maxLoad() - map.count() == 1) break;
+        try t.print('x');
+    }
+
+    const x = t.screens.active.cursor.x;
+    const y = t.screens.active.cursor.y;
+    try t.print('#');
+
+    // Without the fix this crashed appending to a freed page.
+    try t.print(0xFE0F);
+
+    {
+        // '#' is wide and carries the VS16 grapheme.
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = x,
+            .y = y,
+        } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(@as(u21, '#'), cell.content.codepoint.data);
+        try testing.expectEqual(Cell.Wide.wide, cell.wide);
+        try testing.expect(cell.hasGrapheme());
+        try testing.expectEqualSlices(
+            u21,
+            &.{0xFE0F},
+            list_cell.node.page().lookupGrapheme(cell).?,
+        );
+    }
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = x + 1,
+            .y = y,
+        } }).?;
+        try testing.expectEqual(Cell.Wide.spacer_tail, list_cell.cell.wide);
+    }
+}
+
+test "Terminal: grapheme transfer when widening wraps to the next line" {
+    // Covers print's grapheme `.wide` path where the previous cell already
+    // holds grapheme data and has to be moved to the wrapped row.
+    var t = try init(testing.io, testing.allocator, .{ .rows = 5, .cols = 3 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.grapheme_cluster, true);
+    t.cursorRight(2);
+
+    // A narrow emoji, then ZWJ, then a second emoji. The ZWJ attaches
+    // without changing the width, so the cell has grapheme data by the time
+    // the second emoji widens it.
+    try t.print(0x263A);
+    try t.print(0x200D);
+    try t.print(0x2764);
+
+    {
+        // The old cell becomes a spacer head on the wrapped row.
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{
+            .x = 2,
+            .y = 0,
+        } }).?;
+        try testing.expectEqual(Cell.Wide.spacer_head, list_cell.cell.wide);
+        try testing.expect(list_cell.row.wrap);
+    }
+    {
+        // The grapheme moved with the base codepoint.
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{
+            .x = 0,
+            .y = 1,
+        } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(@as(u21, 0x263A), cell.content.codepoint.data);
+        try testing.expectEqual(Cell.Wide.wide, cell.wide);
+        try testing.expectEqualSlices(
+            u21,
+            &.{ 0x200D, 0x2764 },
+            list_cell.node.page().lookupGrapheme(cell).?,
+        );
+    }
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{
+            .x = 1,
+            .y = 1,
+        } }).?;
+        try testing.expectEqual(Cell.Wide.spacer_tail, list_cell.cell.wide);
+    }
+}
+
 test "Terminal: VS16 to make wide character with pending wrap" {
     var t = try init(testing.io, testing.allocator, .{ .rows = 5, .cols = 3 });
     defer t.deinit(testing.allocator);
@@ -7275,6 +7434,85 @@ test "Terminal: print wide char at right edge with hyperlink" {
         const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 1, .y = 1 } }).?;
         try testing.expectEqual(Cell.Wide.spacer_tail, list_cell.cell.wide);
         try testing.expect(list_cell.cell.hyperlink);
+    }
+}
+
+// A cursor style or hyperlink ID is an index into a set stored in the
+// page memory of the page the cursor pin points at. When scrollClear
+// (here via ED 22, kitty's scroll_complete) pushes the active area onto
+// a later page while the cursor pin is still on an earlier one,
+// cursorReload must migrate the cursor's style and hyperlink references
+// to the destination page. It previously replaced the pin directly,
+// leaving the cursor holding an ID that was dead or aliased an unrelated
+// entry on the new page, and the next print attached a live cell to it.
+// Found via fuzzing.
+test "Terminal: scrollClear across pages keeps cursor hyperlink refs page-local" {
+    const alloc = testing.allocator;
+
+    // Minimized from a 774-byte AFL fuzz input. Reading it:
+    //
+    //   A                 print, so REP has something to repeat
+    //   ESC [ 48111 b     REP, filling the page and spilling onto a second
+    //   ESC ] 8 ; ; 0x93  OSC 8; the C1 byte terminates the OSC and makes
+    //                     the URI non-empty, so a hyperlink starts
+    //   ESC [ 11 A        CUU, moving the cursor back onto the first page
+    //   ESC [ 22 J        ED 22, i.e. scroll_complete -> Screen.scrollClear
+    //   B                 print, which attaches the cursor hyperlink
+    //   ESC ] 8 ; ; ESC   OSC 8 with an empty URI, ending the hyperlink
+    //
+    // The grid must be wide enough to fill a page from a single REP, so
+    // this does not reproduce at 80x24.
+    const input = "A\x1b[48111b\x1b]8;;\x93\x1b[11A\x1b[22JB\x1b]8;;\x1b";
+
+    var t = try init(testing.io, alloc, .{ .cols = 200, .rows = 50 });
+    defer t.deinit(alloc);
+
+    {
+        var s = t.vtStream();
+        defer s.deinit();
+        s.nextSlice(input);
+    }
+
+    // With slow runtime safety on, the page integrity checks during the
+    // stream above already catch the bug. Verify the ref counts explicitly
+    // as well so this test is meaningful with runtime safety off: every
+    // cell holding a hyperlink ID owns a reference, so a count below the
+    // number of holding cells means a live cell points at an entry that
+    // was already freed.
+    var node_ = t.screens.active.pages.pages.first;
+    while (node_) |node| : (node_ = node.next) {
+        const page = node.page();
+        const cap = page.hyperlink_set.layout.cap;
+        if (cap == 0) continue;
+
+        const holders = try alloc.alloc(u32, cap);
+        defer alloc.free(holders);
+        @memset(holders, 0);
+
+        for (page.rows.ptr(page.memory)[0..page.size.rows]) |*row| {
+            if (!row.hyperlink) continue;
+            for (row.cells.ptr(page.memory)[0..page.size.cols]) |*cell| {
+                if (!cell.hyperlink) continue;
+                const id = page.lookupHyperlink(cell) orelse continue;
+                if (id < cap) holders[id] += 1;
+            }
+        }
+
+        for (holders, 0..) |held, id| {
+            if (held == 0) continue;
+            const refs = page.hyperlink_set.refCount(page.memory, @intCast(id));
+            try testing.expect(refs >= held);
+        }
+    }
+
+    // If the cursor still has an active hyperlink, its own extra
+    // reference must live on the cursor's page.
+    const cursor = &t.screens.active.cursor;
+    if (cursor.hyperlink_id != 0) {
+        const page = cursor.page_pin.node.page();
+        try testing.expect(
+            page.hyperlink_set.refCount(page.memory, cursor.hyperlink_id) > 0,
+        );
     }
 }
 
@@ -9681,6 +9919,38 @@ test "Terminal: eraseChars wide char wrap boundary conditions" {
         const unwrapped = try t.plainStringUnwrapped(alloc);
         defer testing.allocator.free(unwrapped);
         try testing.expectEqualStrings(".......     cde\n😀......", unwrapped);
+    }
+}
+
+test "Terminal: eraseChars clearing wrapped wide char marks spacer head row dirty" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .rows = 3, .cols = 5 });
+    defer t.deinit(alloc);
+
+    // The wide char doesn't fit so it wraps, leaving a spacer head at
+    // the end of the first row.
+    try t.printString("ABCD字");
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 4, .y = 0 } }).?;
+        try testing.expectEqual(Cell.Wide.spacer_head, list_cell.cell.wide);
+        try testing.expect(list_cell.row.wrap);
+    }
+
+    t.setCursorPos(2, 1);
+    t.clearDirty();
+    t.eraseChars(1);
+    t.screens.active.cursor.page_pin.node.page().assertIntegrity();
+
+    // Erasing the wide char also clears the spacer head on the previous
+    // row, so that row must be dirty too.
+    try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
+    try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 1 } }));
+    try testing.expect(!t.isDirty(.{ .screen = .{ .x = 0, .y = 2 } }));
+
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 4, .y = 0 } }).?;
+        try testing.expectEqual(Cell.Wide.narrow, list_cell.cell.wide);
     }
 }
 
@@ -13118,8 +13388,15 @@ test "Terminal: deleteChars wide char wrap boundary conditions" {
     }
 
     t.setCursorPos(2, 2);
+    t.clearDirty();
     t.deleteChars(3);
     t.screens.active.cursor.page_pin.node.page().assertIntegrity();
+
+    // Deleting the wide char also clears the spacer head on the previous
+    // row, so that row must be dirty too.
+    try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
+    try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 1 } }));
+    try testing.expect(!t.isDirty(.{ .screen = .{ .x = 0, .y = 2 } }));
 
     {
         const str = try t.plainString(alloc);
@@ -15406,6 +15683,34 @@ test "Terminal: fullReset status display" {
     try testing.expect(t.status_display == .main);
 }
 
+test "Terminal: fullReset preserves kitty graphics limits" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    const temp_dir = "/tmp/ghostty-kitty-images";
+
+    var t = try init(testing.io, alloc, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(alloc);
+
+    t.setKittyGraphicsLoadingLimits(.allWithTempDir(temp_dir));
+    for ([_]usize{ 1234, 0 }) |total_limit| {
+        t.setKittyGraphicsSizeLimit(alloc, total_limit);
+        t.fullReset();
+
+        const storage = &t.screens.active.kitty_images;
+        try testing.expectEqual(total_limit, storage.total_limit);
+        try testing.expect(storage.image_limits.file);
+        try testing.expect(storage.image_limits.shared_memory);
+        switch (storage.image_limits.temporary_file) {
+            .enabled => |value| try testing.expectEqualStrings(
+                temp_dir,
+                value.directory,
+            ),
+            .disabled => return error.TestUnexpectedResult,
+        }
+    }
+}
+
 // https://github.com/mitchellh/ghostty/issues/1607
 test "Terminal: fullReset clears alt screen kitty keyboard state" {
     var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
@@ -16039,4 +16344,162 @@ test "Terminal: glyph APC stores session glossary entries" {
 
     t.fullReset();
     try testing.expect(!t.glyph_glossary.contains(0xE0A0));
+}
+
+test "Terminal: scroll region linefeed recycled row has default metadata" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 5, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // A soft-wrapped line across rows 0-2 so that row 1 has both wrap
+    // flags set. Mark row 1 as a prompt as well (OSC 133 A would).
+    for (0..12) |_| try t.print('A');
+    t.screens.active.pages.getCell(
+        .{ .active = .{ .y = 1 } },
+    ).?.row.semantic_prompt = .prompt;
+
+    // DECSTBM rows 2-4, cursor to the region bottom, and linefeed:
+    // row 1 is discarded and its Row storage recycled as the new
+    // blank region-bottom row.
+    t.setTopAndBottomMargin(2, 4);
+    t.setCursorPos(4, 1);
+    try t.linefeed();
+
+    {
+        const rac = t.screens.active.pages.getCell(.{ .active = .{ .y = 3 } }).?;
+        try testing.expect(!rac.row.wrap);
+        try testing.expect(!rac.row.wrap_continuation);
+        try testing.expectEqual(.none, rac.row.semantic_prompt);
+    }
+}
+
+test "Terminal: alt screen scroll up recycled row has default metadata" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 5, .rows = 3 });
+    defer t.deinit(alloc);
+
+    try t.switchScreenMode(.@"1049", true);
+
+    // A soft-wrapped line across rows 0-1 and a prompt mark on row 0.
+    for (0..7) |_| try t.print('A');
+    t.screens.active.pages.getCell(
+        .{ .active = .{} },
+    ).?.row.semantic_prompt = .prompt;
+
+    // Scroll up: with no scrollback, row 0 is discarded and its Row
+    // storage recycled as the new blank bottom row.
+    try t.scrollUp(1);
+
+    {
+        const rac = t.screens.active.pages.getCell(.{ .active = .{ .y = 2 } }).?;
+        try testing.expect(!rac.row.wrap);
+        try testing.expect(!rac.row.wrap_continuation);
+        try testing.expectEqual(.none, rac.row.semantic_prompt);
+    }
+}
+
+test "Terminal: insertLines count over region blanks row metadata" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 5, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // A soft-wrapped line across rows 0-2 so that row 1 has both wrap
+    // flags set, plus a prompt mark on row 1.
+    for (0..12) |_| try t.print('A');
+    t.screens.active.pages.getCell(
+        .{ .active = .{ .y = 1 } },
+    ).?.row.semantic_prompt = .prompt;
+
+    // Insert more lines than remain in the region: every row from the
+    // cursor to the region bottom is blanked in place, with no shifts.
+    t.setCursorPos(2, 1);
+    t.insertLines(10);
+
+    for (1..5) |y| {
+        const rac = t.screens.active.pages.getCell(
+            .{ .active = .{ .y = @intCast(y) } },
+        ).?;
+        try testing.expect(!rac.row.wrap);
+        try testing.expect(!rac.row.wrap_continuation);
+        try testing.expectEqual(.none, rac.row.semantic_prompt);
+    }
+}
+
+test "Terminal: deleteLines count over region blanks row metadata" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 5, .rows = 5 });
+    defer t.deinit(alloc);
+
+    for (0..12) |_| try t.print('A');
+    t.screens.active.pages.getCell(
+        .{ .active = .{ .y = 1 } },
+    ).?.row.semantic_prompt = .prompt;
+
+    t.setCursorPos(2, 1);
+    t.deleteLines(10);
+
+    for (1..5) |y| {
+        const rac = t.screens.active.pages.getCell(
+            .{ .active = .{ .y = @intCast(y) } },
+        ).?;
+        try testing.expect(!rac.row.wrap);
+        try testing.expect(!rac.row.wrap_continuation);
+        try testing.expectEqual(.none, rac.row.semantic_prompt);
+    }
+}
+
+test "Terminal: deleteLines blank row does not retain semantic prompt" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 5, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // Mark row 0 as a prompt row, then delete it. The blank row that
+    // appears at the region bottom reuses the deleted row's storage
+    // and must not read as a prompt (e.g. for prompt navigation).
+    try t.print('$');
+    t.screens.active.pages.getCell(
+        .{ .active = .{} },
+    ).?.row.semantic_prompt = .prompt;
+
+    t.setCursorPos(1, 1);
+    t.deleteLines(1);
+
+    {
+        const rac = t.screens.active.pages.getCell(.{ .active = .{ .y = 2 } }).?;
+        try testing.expect(!rac.row.wrap);
+        try testing.expect(!rac.row.wrap_continuation);
+        try testing.expectEqual(.none, rac.row.semantic_prompt);
+    }
+}
+
+test "Terminal: eraseDisplay complete ignores stale prompt on recycled row" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // Screen content that must NOT enter the scrollback on a clear.
+    try t.printString("hello");
+
+    // Mark row 1 as a prompt row and then discard it with a region
+    // scroll, recycling its storage as the blank bottom row.
+    t.screens.active.pages.getCell(
+        .{ .active = .{ .y = 1 } },
+    ).?.row.semantic_prompt = .prompt;
+    t.setTopAndBottomMargin(2, 3);
+    t.setCursorPos(3, 1);
+    try t.linefeed();
+    t.setTopAndBottomMargin(0, 0);
+
+    // ED2: since no prompt is on screen, this must NOT take the
+    // scroll-and-clear path that pushes content into scrollback. A
+    // stale prompt flag on the recycled blank bottom row would.
+    t.eraseDisplay(.complete, false);
+
+    try testing.expectEqual(t.screens.active.pages.rows, t.screens.active.pages.total_rows);
 }

@@ -1291,6 +1291,18 @@ pub const Page = struct {
         @memset(@as([]u64, @ptrCast(cells)), 0);
     }
 
+    /// Reset the given row to the default state: all cells zeroed and
+    /// all row metadata reset, as if the row was never used. This
+    /// reclaims memory used by graphemes, styles, etc. like clearCells.
+    ///
+    /// This must be used instead of clearCells whenever a row's storage
+    /// is recycled. Clearing the cells alone is not enough because row
+    /// metadata such as the wrap state and semantic prompt remain.
+    pub inline fn resetRow(self: *Page, row: *Row) void {
+        self.clearCells(row, 0, self.size.cols);
+        row.reset();
+    }
+
     /// Returns the hyperlink ID for the given cell.
     pub inline fn lookupHyperlink(self: *const Page, cell: *const Cell) ?hyperlink.Id {
         const cell_offset = getOffset(Cell, self.memory, cell);
@@ -2040,6 +2052,26 @@ pub const Row = packed struct(u64) {
     pub inline fn managedMemory(self: Row) bool {
         // Ordered on purpose for likelihood.
         return self.styled or self.hyperlink or self.grapheme;
+    }
+
+    /// Reset all row metadata to the default state, preserving only
+    /// the cells offset, and mark the row dirty. This is a single
+    /// 8-byte store.
+    ///
+    /// This must be applied to any row whose storage is recycled as a
+    /// blank row or retired into unused page capacity, in addition to
+    /// clearing its cells (in either order; this doesn't touch cell
+    /// memory). See Page.resetRow, which does both, for details. This
+    /// exists separately for callers that clear the cells in a
+    /// specialized way (e.g. filling with a background-colored blank
+    /// cell rather than zeroing).
+    ///
+    /// Asserts that the row has no managed memory: releasing that is
+    /// the cell-clearing side's job and must happen while the flags
+    /// are still accurate.
+    pub inline fn reset(self: *Row) void {
+        assert(!self.managedMemory());
+        self.* = .{ .cells = self.cells, .dirty = true };
     }
 };
 

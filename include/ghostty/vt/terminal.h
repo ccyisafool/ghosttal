@@ -95,7 +95,8 @@ extern "C" {
  * | `GHOSTTY_TERMINAL_OPT_SIZE`             | `GhosttyTerminalSizeFn`           | XTWINOPS query (CSI 14/16/18 t) or mode 2048 enable |
  * | `GHOSTTY_TERMINAL_OPT_COLOR_SCHEME`     | `GhosttyTerminalColorSchemeFn`    | Color scheme query (CSI ? 996 n)          |
  * | `GHOSTTY_TERMINAL_OPT_DEVICE_ATTRIBUTES`| `GhosttyTerminalDeviceAttributesFn`| Device attributes query (CSI c / > c / = c)|
- * | `GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE`  | `GhosttyTerminalClipboardWriteFn` | Clipboard write via OSC 52 / OSC 1337     |
+ * | `GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE`  | `GhosttyTerminalClipboardWriteFn` | Clipboard write via OSC 52 / OSC 1337 / OSC 5522 |
+ * | `GHOSTTY_TERMINAL_OPT_CLIPBOARD_READ`   | `GhosttyTerminalClipboardReadFn`  | Clipboard read via OSC 52 "?" / OSC 5522  |
  * | `GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION`| `GhosttyTerminalDesktopNotificationFn` | Desktop notification via OSC 9 / OSC 777 |
  * | `GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT`  | `GhosttyTerminalProgressReportFn` | Progress report via OSC 9;4               |
  * | `GHOSTTY_TERMINAL_OPT_UNKNOWN_SEQUENCE` | `GhosttyTerminalUnknownSequenceFn` | Unsupported sequence identifier          |
@@ -111,6 +112,9 @@ extern "C" {
  *
  * ### Defining a clipboard_write callback
  * @snippet c-vt-effects/src/main.c effects-clipboard-write
+ *
+ * ### Defining a clipboard_read callback
+ * @snippet c-vt-effects/src/main.c effects-clipboard-read
  *
  * ### Defining an unknown_sequence callback
  * @snippet c-vt-effects/src/main.c effects-unknown-sequence
@@ -459,38 +463,7 @@ typedef struct {
 } GhosttyClipboardContent;
 
 /**
- * A semantic, atomic clipboard write.
- *
- * This is a sized struct. The callback must only access fields present in the
- * size reported by `size`. The request, contents array, MIME strings, and
- * data strings are all borrowed and valid only for the callback duration.
- *
- * All entries in `contents` are representations of the same logical value
- * and must be committed atomically. A `contents_len` of zero requests that
- * the destination be cleared. This is distinct from a content entry whose data
- * has zero length.
- *
- * @ingroup terminal
- */
-typedef struct {
-  /** Size of this struct in bytes. */
-  size_t size;
-
-  /** Clipboard destination. */
-  GhosttyClipboardLocation location;
-
-  /** Borrowed array of MIME representations. */
-  const GhosttyClipboardContent* contents;
-
-  /** Number of entries in contents; zero means clear the destination. */
-  size_t contents_len;
-} GhosttyClipboardWrite;
-
-/**
- * Result of a clipboard write callback.
- *
- * Protocols without write acknowledgements, including OSC 52 and iTerm2
- * OSC 1337 Copy, ignore this result.
+ * Result of a clipboard write reply.
  *
  * @ingroup terminal
  */
@@ -516,26 +489,333 @@ typedef enum GHOSTTY_ENUM_TYPED {
 } GhosttyClipboardWriteResult;
 
 /**
+ * The reply to a clipboard write request.
+ *
+ * This is a sized struct; set `size` to `sizeof(GhosttyClipboardWriteReply)`.
+ * The reply is borrowed only for the duration of the reply call and may be
+ * freed as soon as it returns.
+ *
+ * The result answers the program with the matching protocol status for
+ * protocols with a write acknowledgement (OSC 5522: DONE, EPERM, ENOSYS,
+ * EBUSY, EINVAL, EIO); protocols without one (OSC 52, OSC 1337 Copy)
+ * discard the reply. `remember` is ignored on any result other than
+ * GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS.
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  /** Size of this struct in bytes. */
+  size_t size;
+
+  /** Outcome of the write. */
+  GhosttyClipboardWriteResult result;
+
+  /**
+   * Record a session grant so future requests from the same program skip
+   * the permission prompt. Only honored on success when
+   * GhosttyClipboardWrite::can_remember is set.
+   */
+  bool remember;
+} GhosttyClipboardWriteReply;
+
+typedef struct GhosttyClipboardWrite GhosttyClipboardWrite;
+
+/**
+ * Function type used to answer a clipboard write request. Obtained from
+ * GhosttyClipboardWrite::reply; see that struct for the contract.
+ *
+ * @param write The request being answered
+ * @param reply The reply, borrowed only for the duration of this call
+ *
+ * @ingroup terminal
+ */
+typedef void (*GhosttyClipboardWriteReplyFn)(
+    const GhosttyClipboardWrite* write,
+    const GhosttyClipboardWriteReply* reply);
+
+/**
+ * A synchronous request to write clipboard contents.
+ *
+ * This is a sized struct. The callback must only access fields present in the
+ * size reported by `size`. The request, contents array, MIME strings, and
+ * data strings are all borrowed and valid only for the callback duration.
+ *
+ * All entries in `contents` are representations of the same logical value
+ * and must be committed atomically. A `contents_len` of zero requests that
+ * the destination be cleared. This is distinct from a content entry whose data
+ * has zero length.
+ *
+ * The write is answered by calling `reply` with this request and a
+ * GhosttyClipboardWriteReply. This must happen within the clipboard write
+ * request callback. This struct is only valid during that time. Calling 
+ * `reply` more than once is safely ignored. Returning without replying 
+ * denies the write.
+ *
+ * @ingroup terminal
+ */
+struct GhosttyClipboardWrite {
+  /** Size of this struct in bytes. */
+  size_t size;
+
+  /** Clipboard destination. */
+  GhosttyClipboardLocation location;
+
+  /** Borrowed array of MIME representations. */
+  const GhosttyClipboardContent* contents;
+
+  /** Number of entries in contents; zero means clear the destination. */
+  size_t contents_len;
+
+  /**
+   * Name of the writing program for permission prompts, if the protocol
+   * carries one. Empty otherwise.
+   */
+  GhosttyString name;
+
+  /**
+   * True if the terminal already holds a session grant for this request
+   * The embedder should skip any permission prompt and perform the write.
+   */
+  bool granted;
+
+  /**
+   * True if the program supplied a session password, so the embedder may
+   * offer to remember the user's decision through
+   * GhosttyClipboardWriteReply::remember. When false, remember is ignored.
+   */
+  bool can_remember;
+
+  /** Terminal-owned reply state. Do not access. */
+  const void* ctx;
+
+  /** Answer the write; see the struct documentation. */
+  GhosttyClipboardWriteReplyFn reply;
+};
+
+/**
  * Callback function type for clipboard_write.
  *
- * Called synchronously for a complete logical clipboard write. Protocol
- * details such as OSC 52 selectors, base64 encoding, multipart chunks,
- * aliases, and terminators are normalized before this callback is invoked.
- * OSC 52 and iTerm2 OSC 1337 Copy writes therefore use the same callback
- * shape. OSC 52 clipboard read requests ("?") are always ignored and never
- * forwarded to this callback.
+ * The embedder may ask for permission to write or perform the write 
+ * async, but the callback itself is synchronous and the reply function
+ * must be called during the lifetime of this function. While this callback
+ * is active the VT stream is paused.
+ *
+ * Answer by calling `write->reply(write, &reply)` before returning. See
+ * GhosttyClipboardWrite for the full contract. 
+ *
+ * The request may carry an optional program name requesting the write
+ * and the state of prior permission granted. If `can_remember` is set
+ * the response may set the `remember` flag and future requests from this
+ * same program will be "granted" and the embedder can skip permission
+ * requests.
+ *
+ * Clipboard read requests (OSC 52 "?" and OSC 5522 reads) are delivered
+ * to GhosttyTerminalClipboardReadFn instead.
  *
  * @param terminal The terminal handle
  * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
  * @param write Borrowed atomic clipboard write request
- * @return The result of attempting the clipboard write
  *
  * @ingroup terminal
  */
-typedef GhosttyClipboardWriteResult (*GhosttyTerminalClipboardWriteFn)(
+typedef void (*GhosttyTerminalClipboardWriteFn)(
     GhosttyTerminal terminal,
     void* userdata,
     const GhosttyClipboardWrite* write);
+
+/**
+ * Result of a clipboard read reply.
+ *
+ * @ingroup terminal
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+  /** The clipboard was read; the reply carries its contents. */
+  GHOSTTY_CLIPBOARD_READ_RESULT_SUCCESS = 0,
+
+  /** The clipboard read was denied by policy or the user. */
+  GHOSTTY_CLIPBOARD_READ_RESULT_DENIED = 1,
+
+  /** The embedder cannot read this clipboard. */
+  GHOSTTY_CLIPBOARD_READ_RESULT_UNSUPPORTED = 2,
+
+  /** The clipboard is temporarily unavailable. */
+  GHOSTTY_CLIPBOARD_READ_RESULT_BUSY = 3,
+
+  /** Reading the clipboard failed due to an I/O error. */
+  GHOSTTY_CLIPBOARD_READ_RESULT_IO_ERROR = 4,
+  GHOSTTY_CLIPBOARD_READ_RESULT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyClipboardReadResult;
+
+/**
+ * The reply to a clipboard read request.
+ *
+ * This is a sized struct; set `size` to `sizeof(GhosttyClipboardReadReply)`.
+ * All arrays and the strings they point to are borrowed only for the
+ * duration of the reply call and may be freed as soon as it returns.
+ *
+ * Any result other than GHOSTTY_CLIPBOARD_READ_RESULT_SUCCESS answers the
+ * program with an empty clipboard (OSC 52) or the matching protocol status
+ * (OSC 5522: EPERM, ENOSYS, EBUSY, EIO); the other fields are ignored in
+ * that case. On success, `contents` should carry one representation per
+ * requested MIME type (GhosttyClipboardRead::mimes) that the clipboard
+ * has; unrequested representations are ignored. Protocols that carry a
+ * single text value (OSC 52) use the first entry with a text MIME type
+ * such as "text/plain".
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  /** Size of this struct in bytes. */
+  size_t size;
+
+  /** Outcome of the read. */
+  GhosttyClipboardReadResult result;
+
+  /** Borrowed array of MIME representations of the clipboard contents. */
+  const GhosttyClipboardContent* contents;
+
+  /** Number of entries in contents. */
+  size_t contents_len;
+
+  /**
+   * Borrowed array of all MIME types available on the clipboard. Only
+   * used when GhosttyClipboardRead::list is set; may be NULL otherwise.
+   */
+  const GhosttyString* available;
+
+  /** Number of entries in available. */
+  size_t available_len;
+
+  /**
+   * Record a session grant so future requests from the same program skip
+   * the permission prompt. Only honored on success when
+   * GhosttyClipboardRead::can_remember is set.
+   */
+  bool remember;
+} GhosttyClipboardReadReply;
+
+typedef struct GhosttyClipboardRead GhosttyClipboardRead;
+
+/**
+ * Function type used to answer a clipboard read request. Obtained from
+ * GhosttyClipboardRead::reply; see that struct for the contract.
+ *
+ * @param read The request being answered
+ * @param reply The reply, borrowed only for the duration of this call
+ *
+ * @ingroup terminal
+ */
+typedef void (*GhosttyClipboardReadReplyFn)(
+    const GhosttyClipboardRead* read,
+    const GhosttyClipboardReadReply* reply);
+
+/**
+ * A synchronous request to read clipboard contents.
+ *
+ * This is a sized struct. The callback must only access fields present in the
+ * size reported by `size`. The request is borrowed and valid only for the
+ * callback duration.
+ *
+ * The read is answered by calling `reply` with this request and a
+ * GhosttyClipboardReadReply. This must happen before the callback returns;
+ * the request is invalid afterwards. Calling `reply` more than once is
+ * ignored. Returning without replying answers the program with an empty
+ * clipboard (OSC 52) or EPERM (OSC 5522).
+ *
+ * @ingroup terminal
+ */
+struct GhosttyClipboardRead {
+  /** Size of this struct in bytes. */
+  size_t size;
+
+  /** Clipboard to read. */
+  GhosttyClipboardLocation location;
+
+  /**
+   * Borrowed array of the MIME types the program wants, in order of
+   * preference. Protocols that only carry text (OSC 52) request
+   * "text/plain". NULL when mimes_len is zero.
+   */
+  const GhosttyString* mimes;
+
+  /** Number of entries in mimes. */
+  size_t mimes_len;
+
+  /**
+   * True if the program also wants the list of MIME types available on the
+   * clipboard, delivered through GhosttyClipboardReadReply::available.
+   */
+  bool list;
+
+  /**
+   * Name of the requesting program for permission prompts, if the protocol
+   * carries one. Empty otherwise.
+   */
+  GhosttyString name;
+
+  /**
+   * True if the terminal already holds a session grant for this request
+   * (kitty clipboard protocol passwords). The embedder should skip any
+   * permission prompt and serve the read.
+   *
+   * Always false when mimes_len is zero: such a request is served
+   * without a prompt (see the callback docs), so the terminal never
+   * consults grants for it and a one-time password is preserved for
+   * the follow-up data read.
+   */
+  bool granted;
+
+  /**
+   * True if the program supplied a session password, so the embedder may
+   * offer to remember the user's decision through
+   * GhosttyClipboardReadReply::remember. When false, remember is ignored.
+   */
+  bool can_remember;
+
+  /** Terminal-owned reply state. Do not access. */
+  const void* ctx;
+
+  /** Answer the read; see the struct documentation. */
+  GhosttyClipboardReadReplyFn reply;
+};
+
+/**
+ * Callback function type for clipboard_read.
+ *
+ * Called synchronously when the running program requests clipboard contents
+ * via OSC 52 with a "?" payload or a Kitty clipboard (OSC 5522) read.
+ * Answering lets the program read the user's clipboard, so the embedder is
+ * expected to mediate consent. Because the read is synchronous, an embedder
+ * that needs to ask the user must block (for example by running a modal
+ * prompt) until it has an answer; the VT stream waits until the callback
+ * returns.
+ *
+ * Answer by calling `read->reply(read, &reply)` before returning. See
+ * GhosttyClipboardRead for the full contract.
+ *
+ * OSC 5522 requests carry the program's MIME list, name, and password grant
+ * state; a reply that sets `remember` records a session grant so later
+ * requests with the same password arrive with `granted` set. Kitty itself
+ * serves a request for only the targets listing (`list` with no `mimes`)
+ * without prompting, and embedders are expected to do the same; the
+ * terminal never consults grants for such requests (`granted` is false
+ * and one-time passwords are not consumed).
+ *
+ * Installing this callback also enables Kitty paste events (mode 5522):
+ * ghostty_terminal_paste() sends the program an event instead of the text,
+ * and the program's follow-up read arrives here with `granted` set since
+ * the user already pasted. See ghostty_terminal_paste().
+ *
+ * @param terminal The terminal handle
+ * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
+ * @param read Borrowed clipboard read request
+ *
+ * @ingroup terminal
+ */
+typedef void (*GhosttyTerminalClipboardReadFn)(
+    GhosttyTerminal terminal,
+    void* userdata,
+    const GhosttyClipboardRead* read);
 
 /**
  * A request to show a desktop notification.
@@ -1065,10 +1345,11 @@ typedef enum GHOSTTY_ENUM_TYPED {
 
   /**
    * Callback invoked when the running program performs a clipboard write.
-   * OSC 52 and iTerm2 OSC 1337 Copy writes are normalized to an atomic set
-   * of decoded MIME representations. Set to NULL to ignore clipboard writes.
-   * Clipboard read requests are always ignored; see
-   * GhosttyTerminalClipboardWriteFn.
+   * OSC 52, iTerm2 OSC 1337 Copy, and Kitty clipboard (OSC 5522) writes
+   * are normalized to an atomic set of decoded MIME representations. Set
+   * to NULL to ignore clipboard writes (Kitty clipboard writes are then
+   * refused with ENOSYS). Clipboard read requests are delivered to
+   * GHOSTTY_TERMINAL_OPT_CLIPBOARD_READ instead.
    *
    * Input type: GhosttyTerminalClipboardWriteFn
    */
@@ -1230,6 +1511,40 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Input type: GhosttyString*
    */
   GHOSTTY_TERMINAL_OPT_TERMINFO_NAME = 37,
+
+  /**
+   * Callback invoked when the running program requests clipboard contents
+   * via OSC 52 with a "?" payload or a Kitty clipboard (OSC 5522) read. The
+   * read is synchronous and must be answered before the callback returns.
+   * Set to NULL (the default) to ignore OSC 52 read requests and refuse
+   * OSC 5522 reads with EPERM.
+   *
+   * Input type: GhosttyTerminalClipboardReadFn
+   */
+  GHOSTTY_TERMINAL_OPT_CLIPBOARD_READ = 38,
+
+  /**
+   * Set the maximum total decoded bytes a single Kitty clipboard protocol
+   * (OSC 5522) write transaction may accumulate. The limit is captured
+   * when a transaction begins; an in-flight transaction keeps the limit
+   * it started with.
+   *
+   * Data beyond the limit fails the whole transaction with EFBIG. The
+   * transaction is discarded, later write-related packets are ignored
+   * until a new write begins, and nothing reaches the clipboard write
+   * callback.
+   *
+   * Transactions are buffered in memory, so this limit bounds how much
+   * memory a single write can make the terminal allocate. Pass SIZE_MAX
+   * to remove the limit. A NULL value pointer reverts to the built-in
+   * default of 64MiB, the minimum required by the protocol.
+   *
+   * This limit doesn't apply to OSC 52 writes, which are bounded by the
+   * maximum length of an escape sequence instead.
+   *
+   * Input type: size_t*
+   */
+  GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE_MAX_BYTES = 39,
   GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalOption;
 
@@ -1627,6 +1942,15 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: bool *
    */
   GHOSTTY_TERMINAL_DATA_CURSOR_AT_PROMPT = 39,
+
+  /**
+   * The configured maximum decoded bytes per Kitty clipboard protocol
+   * (OSC 5522) write transaction. See
+   * GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE_MAX_BYTES.
+   *
+   * Output type: size_t *
+   */
+  GHOSTTY_TERMINAL_DATA_CLIPBOARD_WRITE_MAX_BYTES = 40,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 

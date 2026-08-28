@@ -50,13 +50,14 @@ pub const Options = struct {
 /// `--prune=6h`, `--prune=1y`.
 ///
 /// Examples:
-///   ghosttal +ssh-cache                           # List all cached destinations
-///   ghosttal +ssh-cache user@example.com          # Show that destination
-///   ghosttal +ssh-cache example.com               # Show all users on that host
-///   ghosttal +ssh-cache --add=user@example.com    # Manually add a destination
-///   ghosttal +ssh-cache --remove=user@example.com # Remove that destination
-///   ghosttal +ssh-cache --prune=30d               # Remove entries older than 30 days
-///   ghosttal +ssh-cache --clear                   # Clear the entire cache
+///
+///     ghosttal +ssh-cache                           # List all cached destinations
+///     ghosttal +ssh-cache user@example.com          # Show that destination
+///     ghosttal +ssh-cache example.com               # Show all users on that host
+///     ghosttal +ssh-cache --add=user@example.com    # Manually add a destination
+///     ghosttal +ssh-cache --remove=user@example.com # Remove a destination
+///     ghosttal +ssh-cache --prune=30d               # Remove entries older than 30 days
+///     ghosttal +ssh-cache --clear                   # Clear entire cache
 pub fn run(alloc_gpa: Allocator) !u8 {
     var arena = std.heap.ArenaAllocator.init(alloc_gpa);
     defer arena.deinit();

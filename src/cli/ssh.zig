@@ -162,17 +162,17 @@ pub const Options = struct {
 ///
 /// Examples:
 ///
-///   # Basic invocation using defaults:
-///   ghosttal +ssh user@example.com
+///     # Basic invocation using defaults:
+///     ghosttal +ssh user@example.com
 ///
-///   # Forward Ghostty env vars but skip the terminfo install:
-///   ghosttal +ssh --terminfo=false user@example.com
+///     # Forward Ghostty env vars but skip the terminfo install:
+///     ghosttal +ssh --terminfo=false user@example.com
 ///
-///   # `ssh` flags (short-form `-p`, etc.) pass through unchanged:
-///   ghosttal +ssh -p 2222 -i ~/.ssh/id_ed25519 user@example.com
+///     # `ssh` flags (short-form `-p`, etc.) pass through unchanged:
+///     ghosttal +ssh -p 2222 -i ~/.ssh/id_ed25519 user@example.com
 ///
-///   # Use `--` explicitly if your ssh args might collide with our flags:
-///   ghosttal +ssh -- --some-rare-ssh-arg user@example.com
+///     # Use `--` explicitly if your ssh args might collide with our flags:
+///     ghosttal +ssh -- --some-rare-ssh-arg user@example.com
 ///
 /// Pass `--verbose` to see what `+ssh` is doing. For cache inspection
 /// and management, see `ghosttal +ssh-cache`.
