@@ -3042,7 +3042,7 @@ keybind: Keybinds = .{},
 /// command-palette-entry = title:Reset Font Style, action:csi:0m
 /// command-palette-entry = title:Crash on Main Thread,description:Causes a crash on the main (UI) thread.,action:crash:main
 /// command-palette-entry = title:Focus Split: Right,description:"Focus the split to the right, if it exists.",action:goto_split:right
-/// command-palette-entry = title:"Ghostty",description:"Add a little Ghostty to your terminal.",action:"text:\xf0\x9f\x91\xbb"
+/// command-palette-entry = title:"Ghosttal",description:"Add a little Ghosttal to your terminal.",action:"text:\xf0\x9f\x91\xbb"
 /// ```
 ///
 /// There are some additional special values that can be specified for
@@ -4273,6 +4273,46 @@ fn loadDefaultFilePair(
     }
 
     return action != .not_found or legacy_action != .not_found;
+}
+
+test "Ghosttal config overlay wins over Ghostty base" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var td = try internal_os.TempDir.init();
+    defer td.deinit();
+
+    var writer_buf: [256]u8 = undefined;
+    {
+        var file = try td.dir.createFile(testing.io, "ghostty-base", .{});
+        defer file.close(testing.io);
+        var writer = file.writer(testing.io, &writer_buf);
+        try writer.interface.writeAll("cursor-motion = ease\ninput-motion = false\n");
+        try writer.end();
+    }
+    {
+        var file = try td.dir.createFile(testing.io, "ghosttal-overlay", .{});
+        defer file.close(testing.io);
+        var writer = file.writer(testing.io, &writer_buf);
+        try writer.interface.writeAll("cursor-motion = spring\ninput-motion = true\n");
+        try writer.end();
+    }
+
+    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = base_buf[0..try td.dir.realPathFile(testing.io, "ghostty-base", &base_buf)];
+    var overlay_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const overlay = overlay_buf[0..try td.dir.realPathFile(testing.io, "ghosttal-overlay", &overlay_buf)];
+    var missing_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const missing = try std.fmt.bufPrint(&missing_buf, "{s}.missing", .{base});
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    try testing.expect(cfg.loadDefaultFilePair(alloc, missing, base));
+    try testing.expectEqual(CursorMotion.ease, cfg.@"cursor-motion");
+    try testing.expect(!cfg.@"input-motion");
+
+    try testing.expect(cfg.loadDefaultFilePair(alloc, missing, overlay));
+    try testing.expectEqual(CursorMotion.spring, cfg.@"cursor-motion");
+    try testing.expect(cfg.@"input-motion");
 }
 
 /// Load and parse the CLI args.

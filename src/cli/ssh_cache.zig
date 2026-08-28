@@ -50,13 +50,13 @@ pub const Options = struct {
 /// `--prune=6h`, `--prune=1y`.
 ///
 /// Examples:
-///   ghostty +ssh-cache                           # List all cached destinations
-///   ghostty +ssh-cache user@example.com          # Show that destination
-///   ghostty +ssh-cache example.com               # Show all users on that host
-///   ghostty +ssh-cache --add=user@example.com    # Manually add a destination
-///   ghostty +ssh-cache --remove=user@example.com # Remove a destination
-///   ghostty +ssh-cache --prune=30d               # Remove entries older than 30 days
-///   ghostty +ssh-cache --clear                   # Clear entire cache
+///   ghosttal +ssh-cache                           # List all cached destinations
+///   ghosttal +ssh-cache user@example.com          # Show that destination
+///   ghosttal +ssh-cache example.com               # Show all users on that host
+///   ghosttal +ssh-cache --add=user@example.com    # Manually add a destination
+///   ghosttal +ssh-cache --remove=user@example.com # Remove that destination
+///   ghosttal +ssh-cache --prune=30d               # Remove entries older than 30 days
+///   ghosttal +ssh-cache --clear                   # Clear the entire cache
 pub fn run(alloc_gpa: Allocator) !u8 {
     var arena = std.heap.ArenaAllocator.init(alloc_gpa);
     defer arena.deinit();
@@ -90,7 +90,7 @@ pub fn run(alloc_gpa: Allocator) !u8 {
             if (is_host_flag) {
                 try stderr.print(
                     "Warning: --host is deprecated; pass the destination " ++
-                        "directly, e.g. `ghostty +ssh-cache {s}`.\n",
+                        "directly, e.g. `ghosttal +ssh-cache {s}`.\n",
                     .{arg["--host=".len..]},
                 );
             }
@@ -135,7 +135,7 @@ pub fn run(alloc_gpa: Allocator) !u8 {
     }
 
     // Setup our disk cache to the standard location
-    const cache_path = DiskCache.defaultPath(alloc, "ghostty") catch |err| {
+    const cache_path = DiskCache.defaultPath(alloc, "ghosttal") catch |err| {
         try stderr.print(
             "Error: unable to determine the cache path: {t}\n",
             .{err},

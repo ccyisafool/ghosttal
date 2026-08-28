@@ -143,7 +143,7 @@ pub fn init(
         open.has_side_effects = true;
         open.cwd = b.path("");
         open.addArgs(&.{b.fmt(
-            "{s}/Contents/MacOS/ghostty",
+            "{s}/Contents/MacOS/ghosttal",
             .{app_path},
         )});
 

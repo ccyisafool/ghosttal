@@ -3,27 +3,36 @@
 set -euo pipefail
 
 readonly SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-readonly RELEASE_VERSION="${RELEASE_VERSION:-0.1.3}"
 readonly SIGNING_IDENTITY="${SIGNING_IDENTITY:-Developer ID Application: Chenyang Cheng (Y63C8FW5ZK)}"
 readonly OUTPUT_DIR="${OUTPUT_DIR:-${SOURCE_ROOT}/dist}"
 readonly APPCAST_PATH="${APPCAST_PATH:-${SOURCE_ROOT}/appcast.xml}"
-readonly DOWNLOAD_URL_BASE="https://github.com/ccyisafool/ghosttal/releases/download/v${RELEASE_VERSION}"
-readonly RELEASE_NOTES_URL="https://github.com/ccyisafool/ghosttal/releases/tag/v${RELEASE_VERSION}"
 readonly MINIMUM_SYSTEM_VERSION="13.0"
-readonly TEMP_ROOT="$(mktemp -d "${TMPDIR:-/private/tmp}/ghosttal-release.XXXXXX")"
+readonly RELEASE_VERSION="${RELEASE_VERSION:-}"
+
+[[ "${RELEASE_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+  echo "Set RELEASE_VERSION to an X.Y.Z version." >&2
+  exit 1
+}
+
+readonly RELEASE_TAG="v${RELEASE_VERSION}"
+readonly DOWNLOAD_URL_BASE="https://github.com/ccyisafool/ghosttal/releases/download/${RELEASE_TAG}"
+readonly RELEASE_NOTES_URL="https://github.com/ccyisafool/ghosttal/releases/tag/${RELEASE_TAG}"
+readonly TEMP_PARENT="${TMPDIR:-/private/tmp}"
+readonly TEMP_ROOT="$(mktemp -d "${TEMP_PARENT%/}/ghosttal-release.XXXXXX")"
 readonly STAGE_ROOT="${TEMP_ROOT}/source"
 readonly APP_PATH="${STAGE_ROOT}/macos/build/Release/Ghosttal.app"
 readonly DMG_NAME="Ghosttal-${RELEASE_VERSION}-universal.dmg"
 readonly DMG_SOURCE="${TEMP_ROOT}/dmg"
 readonly DMG_MOUNT="${TEMP_ROOT}/mount"
 readonly STAGED_DMG="${TEMP_ROOT}/${DMG_NAME}"
+readonly CREATE_DMG="${CREATE_DMG:-create-dmg}"
 
 cleanup() {
   hdiutil detach "${DMG_MOUNT}" >/dev/null 2>&1 || true
-
-  if [[ "${TEMP_ROOT}" == /private/tmp/ghosttal-release.* || "${TEMP_ROOT}" == /tmp/ghosttal-release.* ]]; then
-    rm -rf -- "${TEMP_ROOT}"
-  fi
+  case "${TEMP_ROOT}" in
+    "${TEMP_PARENT%/}"/ghosttal-release.*) rm -rf -- "${TEMP_ROOT}" ;;
+    *) echo "Refusing to remove unexpected temporary path: ${TEMP_ROOT}" >&2 ;;
+  esac
 }
 trap cleanup EXIT
 
@@ -31,28 +40,41 @@ retry() {
   local max_attempts="$1"
   shift
   local attempt=1
-
   until "$@"; do
-    if (( attempt >= max_attempts )); then
-      return 1
-    fi
-
+    if (( attempt >= max_attempts )); then return 1; fi
     echo "Command failed; retrying (${attempt}/${max_attempts}): $*" >&2
-    sleep 30
+    sleep 15
     ((attempt += 1))
   done
 }
 
-for command_name in zig nu xcodebuild codesign hdiutil xcrun lipo rsync ditto ln readlink; do
+for command_name in zig nu xcodebuild codesign hdiutil xcrun lipo ditto readlink git tar shasum spctl; do
   command -v "${command_name}" >/dev/null || {
     echo "Missing required command: ${command_name}" >&2
     exit 1
   }
 done
+command -v "${CREATE_DMG}" >/dev/null || {
+  echo "create-dmg is unavailable; install it or set CREATE_DMG to its executable." >&2
+  exit 1
+}
 
-# Notary credentials: prefer an App Store Connect API key when provided via
-# the environment (CI), otherwise probe the keychain credential profiles
-# that notarytool stores in the data-protection keychain (local machines).
+[[ -z "$(git -C "${SOURCE_ROOT}" status --porcelain --untracked-files=all)" ]] || {
+  echo "Release checkout must be clean, including untracked files." >&2
+  exit 1
+}
+[[ "$(git -C "${SOURCE_ROOT}" rev-parse "${RELEASE_TAG}^{commit}" 2>/dev/null)" == \
+   "$(git -C "${SOURCE_ROOT}" rev-parse HEAD)" ]] || {
+  echo "${RELEASE_TAG} must exist and point at HEAD." >&2
+  exit 1
+}
+grep -Eq "^## ${RELEASE_VERSION//./\\.}([[:space:]]|$)" "${SOURCE_ROOT}/CHANGELOG.md" || {
+  echo "CHANGELOG.md has no ${RELEASE_VERSION} release section." >&2
+  exit 1
+}
+
+# Prefer App Store Connect API credentials in CI; otherwise use a local
+# notarytool keychain profile.
 NOTARY_AUTH_ARGS=()
 if [[ -n "${NOTARY_KEY_FILE:-}" ]]; then
   [[ -n "${NOTARY_KEY_ID:-}" && -n "${NOTARY_ISSUER_ID:-}" ]] || {
@@ -60,7 +82,6 @@ if [[ -n "${NOTARY_KEY_FILE:-}" ]]; then
     exit 1
   }
   NOTARY_AUTH_ARGS=(--key "${NOTARY_KEY_FILE}" --key-id "${NOTARY_KEY_ID}" --issuer "${NOTARY_ISSUER_ID}")
-  echo "Using notary App Store Connect API key: ${NOTARY_KEY_ID}"
 else
   if [[ -z "${NOTARY_PROFILE:-}" ]]; then
     for candidate in ghosttal-notary notarytool; do
@@ -69,17 +90,14 @@ else
         break
       fi
     done
-    [[ -n "${NOTARY_PROFILE:-}" ]] || {
-      echo "No notary credential profile found (tried: ghosttal-notary, notarytool)." >&2
-      echo "Run: xcrun notarytool store-credentials <profile> --apple-id <id> --team-id Y63C8FW5ZK" >&2
-      exit 1
-    }
   fi
+  [[ -n "${NOTARY_PROFILE:-}" ]] || {
+    echo "No notary credential profile found (tried ghosttal-notary and notarytool)." >&2
+    exit 1
+  }
   NOTARY_AUTH_ARGS=(--keychain-profile "${NOTARY_PROFILE}")
-  echo "Using notary profile: ${NOTARY_PROFILE}"
 fi
 
-# Sparkle's CLI tools ship with the SPM artifact checkout.
 if [[ -z "${SPARKLE_BIN:-}" ]]; then
   SPARKLE_BIN="$(find "${HOME}/Library/Developer/Xcode/DerivedData" \
     -type d -path "*/SourcePackages/artifacts/sparkle/Sparkle/bin" 2>/dev/null | head -1)"
@@ -90,100 +108,86 @@ fi
 }
 readonly SPARKLE_BIN
 
-# The app's Info.plist version keys must match the release version, or Sparkle
-# will not recognize published updates as newer than installed builds.
-grep -Fq "MARKETING_VERSION = ${RELEASE_VERSION};" "${SOURCE_ROOT}/macos/Ghostty.xcodeproj/project.pbxproj" || {
-  echo "MARKETING_VERSION in project.pbxproj does not match RELEASE_VERSION=${RELEASE_VERSION}" >&2
-  exit 1
-}
-grep -Fq "CURRENT_PROJECT_VERSION = ${RELEASE_VERSION};" "${SOURCE_ROOT}/macos/Ghostty.xcodeproj/project.pbxproj" || {
-  echo "CURRENT_PROJECT_VERSION in project.pbxproj does not match RELEASE_VERSION=${RELEASE_VERSION}" >&2
-  exit 1
-}
-
+for setting in MARKETING_VERSION CURRENT_PROJECT_VERSION; do
+  grep -Fq "${setting} = ${RELEASE_VERSION};" "${SOURCE_ROOT}/macos/Ghostty.xcodeproj/project.pbxproj" || {
+    echo "${setting} does not include RELEASE_VERSION=${RELEASE_VERSION}" >&2
+    exit 1
+  }
+done
 security find-identity -v -p codesigning | grep -Fq "${SIGNING_IDENTITY}" || {
   echo "Signing identity is unavailable: ${SIGNING_IDENTITY}" >&2
   exit 1
 }
 
 mkdir -p "${STAGE_ROOT}" "${OUTPUT_DIR}"
-rsync -a \
-  --exclude .git \
-  --exclude .zig-cache \
-  --exclude zig-cache \
-  --exclude zig-out \
-  --exclude zig-pkg \
-  --exclude macos/build \
-  --exclude macos/GhosttyKit.xcframework \
-  --exclude '*.key' \
-  --exclude '*.csr' \
-  --exclude '*.p12' \
-  "${SOURCE_ROOT}/" "${STAGE_ROOT}/"
-
+git -C "${SOURCE_ROOT}" archive --format=tar HEAD | tar -xf - -C "${STAGE_ROOT}"
 cd "${STAGE_ROOT}"
 
 zig build -Demit-macos-app=false -Doptimize=ReleaseFast
 ./macos/build.nu --scheme Ghostty --configuration Release --action build
 
-[[ -d "${APP_PATH}" ]] || {
-  echo "Release app was not produced at ${APP_PATH}" >&2
+[[ -d "${APP_PATH}" ]] || { echo "Release app was not produced at ${APP_PATH}" >&2; exit 1; }
+readonly BUILT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${APP_PATH}/Contents/Info.plist")"
+readonly BUILT_NUMBER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "${APP_PATH}/Contents/Info.plist")"
+[[ "${BUILT_VERSION}" == "${RELEASE_VERSION}" && "${BUILT_NUMBER}" == "${RELEASE_VERSION}" ]] || {
+  echo "Built app version ${BUILT_VERSION} (${BUILT_NUMBER}) does not match ${RELEASE_VERSION}." >&2
   exit 1
 }
-
 readonly APP_ARCHS="$(lipo -archs "${APP_PATH}/Contents/MacOS/ghosttal")"
 [[ " ${APP_ARCHS} " == *" arm64 "* && " ${APP_ARCHS} " == *" x86_64 "* ]] || {
   echo "Expected a universal app; found architectures: ${APP_ARCHS}" >&2
   exit 1
 }
 
-retry 20 codesign --force --deep --options runtime --timestamp \
+# Sign Sparkle helpers and other nested code from the inside out, then the app.
+readonly SPARKLE_FRAMEWORK="${APP_PATH}/Contents/Frameworks/Sparkle.framework"
+NESTED_CODE=(
+  "${SPARKLE_FRAMEWORK}/Versions/B/XPCServices/Downloader.xpc"
+  "${SPARKLE_FRAMEWORK}/Versions/B/XPCServices/Installer.xpc"
+  "${SPARKLE_FRAMEWORK}/Versions/B/Autoupdate"
+  "${SPARKLE_FRAMEWORK}/Versions/B/Updater.app"
+  "${SPARKLE_FRAMEWORK}"
+  "${APP_PATH}/Contents/PlugIns/DockTilePlugin.plugin"
+)
+for code_path in "${NESTED_CODE[@]}"; do
+  [[ -e "${code_path}" ]] || { echo "Expected nested code is missing: ${code_path}" >&2; exit 1; }
+  retry 6 codesign --force --options runtime --timestamp --sign "${SIGNING_IDENTITY}" "${code_path}"
+done
+retry 6 codesign --force --options runtime --timestamp \
   --entitlements "${STAGE_ROOT}/macos/Ghostty.entitlements" \
-  --sign "${SIGNING_IDENTITY}" \
-  "${APP_PATH}"
+  --sign "${SIGNING_IDENTITY}" "${APP_PATH}"
 codesign --verify --deep --strict --verbose=2 "${APP_PATH}"
 
 mkdir -p "${DMG_SOURCE}" "${DMG_MOUNT}"
 ditto --rsrc --extattr "${APP_PATH}" "${DMG_SOURCE}/Ghosttal.app"
-ln -s /Applications "${DMG_SOURCE}/Applications"
+"${CREATE_DMG}" \
+  --volname Ghosttal \
+  --background "${STAGE_ROOT}/images/ghosttal/dmg-background.png" \
+  --window-pos 200 120 \
+  --window-size 660 440 \
+  --icon-size 112 \
+  --icon Ghosttal.app 165 278 \
+  --hide-extension Ghosttal.app \
+  --app-drop-link 495 278 \
+  --no-internet-enable \
+  "${STAGED_DMG}" "${DMG_SOURCE}"
 
-hdiutil create \
-  -volname Ghosttal \
-  -srcfolder "${DMG_SOURCE}" \
-  -format UDZO \
-  -ov \
-  "${STAGED_DMG}"
-
-hdiutil attach \
-  -readonly \
-  -nobrowse \
-  -mountpoint "${DMG_MOUNT}" \
-  "${STAGED_DMG}"
-[[ -d "${DMG_MOUNT}/Ghosttal.app" ]] || {
-  echo "DMG is missing Ghosttal.app" >&2
-  exit 1
-}
+hdiutil attach -readonly -nobrowse -mountpoint "${DMG_MOUNT}" "${STAGED_DMG}"
+[[ -d "${DMG_MOUNT}/Ghosttal.app" ]] || { echo "DMG is missing Ghosttal.app" >&2; exit 1; }
 [[ -L "${DMG_MOUNT}/Applications" && "$(readlink "${DMG_MOUNT}/Applications")" == /Applications ]] || {
   echo "DMG is missing the /Applications shortcut" >&2
   exit 1
 }
 hdiutil detach "${DMG_MOUNT}"
 
-retry 20 codesign --force --timestamp --sign "${SIGNING_IDENTITY}" "${STAGED_DMG}"
+retry 6 codesign --force --timestamp --sign "${SIGNING_IDENTITY}" "${STAGED_DMG}"
 codesign --verify --verbose=2 "${STAGED_DMG}"
-
-xcrun notarytool submit "${STAGED_DMG}" \
-  "${NOTARY_AUTH_ARGS[@]}" \
-  --wait
-retry 20 xcrun stapler staple "${STAGED_DMG}"
+xcrun notarytool submit "${STAGED_DMG}" "${NOTARY_AUTH_ARGS[@]}" --wait
+retry 6 xcrun stapler staple "${STAGED_DMG}"
 xcrun stapler validate "${STAGED_DMG}"
 spctl --assess --type open --context context:primary-signature --verbose=2 "${STAGED_DMG}"
-
 ditto --rsrc --extattr "${STAGED_DMG}" "${OUTPUT_DIR}/${DMG_NAME}"
 
-# Sign the DMG with Ghosttal's Sparkle EdDSA key and regenerate the appcast
-# that shipped apps poll (served from the repository's main branch).
-# Sign with an explicit key file when provided (CI); otherwise the key in
-# the login keychain is used (local machines).
 if [[ -n "${SPARKLE_KEY_FILE:-}" ]]; then
   ED_ATTRIBUTES="$("${SPARKLE_BIN}/sign_update" --ed-key-file "${SPARKLE_KEY_FILE}" "${OUTPUT_DIR}/${DMG_NAME}")"
 else
@@ -215,13 +219,8 @@ cat > "${APPCAST_PATH}" <<APPCAST
 </rss>
 APPCAST
 
+(cd "${OUTPUT_DIR}" && shasum -a 256 "${DMG_NAME}" > SHA256SUMS)
 echo "Release ready: ${OUTPUT_DIR}/${DMG_NAME}"
 echo "Architectures: ${APP_ARCHS}"
+echo "Checksum: ${OUTPUT_DIR}/SHA256SUMS"
 echo "Appcast updated: ${APPCAST_PATH}"
-echo
-echo "To publish this release:"
-echo "  1. Commit the appcast (and version bumps), then push main."
-echo "  2. Tag: git tag v${RELEASE_VERSION} && git push origin v${RELEASE_VERSION}"
-echo "  3. Publish: gh release create v${RELEASE_VERSION} '${OUTPUT_DIR}/${DMG_NAME}' --title 'Ghosttal ${RELEASE_VERSION}'"
-echo "  (Publish the GitHub release BEFORE pushing the appcast commit, or"
-echo "   shipped apps may briefly see an enclosure URL that 404s.)"

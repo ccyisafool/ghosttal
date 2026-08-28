@@ -28,7 +28,7 @@ pub fn run(alloc: Allocator) !u8 {
 
     if (tty) if (build_config.version.build) |commit_hash| {
         try stdout.print(
-            "\x1b]8;;https://github.com/ghostty-org/ghostty/commit/{s}\x1b\\",
+            "\x1b]8;;https://github.com/ccyisafool/ghosttal/commit/{s}\x1b\\",
             .{commit_hash},
         );
     };

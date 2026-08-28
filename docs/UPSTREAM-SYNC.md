@@ -1,106 +1,84 @@
-# Syncing Ghosttal with upstream Ghostty and cutting a release
+# Syncing Ghosttal and publishing releases
 
-Ghosttal tracks upstream Ghostty **manually**: when Ghostty ships a release,
-the maintainer merges it here, test-runs locally, and only then publishes a
-Ghosttal release. Installed apps then receive that release through
-Ghosttal's own Sparkle channel — never through Ghostty's update feed.
+Ghosttal tracks [Ghostty](https://github.com/ghostty-org/ghostty) manually.
+Upstream code reaches Ghosttal users only after it is merged, reviewed against
+the fork's patch set, tested, and released through Ghosttal's own Sparkle feed.
 
-## Remotes
+## Remotes and upstream sync
 
-- `origin` — https://github.com/ccyisafool/ghosttal (the fork, push target)
-- `upstream` — https://github.com/ghostty-org/ghostty (read-only)
-
-## 1. Merge an upstream release
+- `origin` — `git@github.com:ccyisafool/ghosttal.git` (push target)
+- `upstream` — `https://github.com/ghostty-org/ghostty` (read-only)
 
 ```sh
 git fetch upstream --tags
-git checkout -b sync/<upstream-version> main
+git switch -c sync/<upstream-version> main
 git merge <upstream-tag-or-commit>
 ```
 
-Expect conflicts concentrated where the fork diverges:
+Review conflicts especially carefully in:
 
-- **Motion features (the point of the fork):** `src/renderer/generic.zig`,
-  `src/renderer/cursor_motion.zig`, `src/renderer/input_motion.zig`,
-  `src/renderer/cell.zig`, `src/renderer/Thread.zig`,
-  `src/renderer/shaders/shaders.metal`, `src/renderer/shaders/glsl/`,
-  `src/renderer/{metal,opengl}/shaders.zig`, `src/config/Config.zig`,
-  `src/Surface.zig`
-- **Config overlay loading:** `src/config/file_load.zig`
-- **Branding/identity (Ghosttal name, bundle id, icon):** `README.md`,
-  `macos/Ghostty.xcodeproj/project.pbxproj`, `macos/Ghostty-Info.plist`,
-  `macos/Sources/App/MainMenu.xib`, assorted user-facing Swift strings,
-  `images/`
-- **Update channel (keep ours, never upstream's):**
-  `macos/Sources/Features/Update/UpdateDelegate.swift` (feed URL),
-  `macos/Ghostty-Info.plist` (`SUPublicEDKey`, `SUEnableAutomaticChecks`)
+- motion rendering: `src/renderer/`, `src/Surface.zig`, and motion shaders;
+- configuration overlay loading: `src/config/`;
+- macOS branding, bundle identity, icon, and visible strings;
+- update configuration in `macos/Ghostty-Info.plist` and the update feature;
+- release scripts and workflows.
 
-Rule of thumb for conflicts: renderer/config conflicts need real merging
-(upstream logic + Ghosttal's motion hooks); branding and update-channel
-conflicts almost always resolve to the Ghosttal side with upstream's
-structural changes applied around them.
+Internal `Ghostty` module, scheme, terminal-protocol, and compatibility names
+remain upstream-compatible. User-facing identity and Ghosttal-owned storage,
+downloads, links, and update endpoints must remain Ghosttal-specific.
 
-After merging:
+After every sync, run:
 
 ```sh
+zig fmt --check .
 zig build test
-zig build            # full app build
+zig build -Demit-macos-app=false
+./macos/build.nu --scheme Ghostty --configuration Debug --action test
 ```
 
-Test-run the app manually (animations, config overlay, menu items), then
-merge the sync branch into `main`.
+Also launch a Debug app and manually exercise cursor/input motion, Reduce
+Motion, the Ghostty-base/Ghosttal-overlay precedence, links, and update checks.
 
-## 2. Cut a Ghosttal release (CI — the default)
+## Automated release
 
-GitHub Actions releases from any machine, with no local signing setup:
+The preferred path is `.github/workflows/release-ghosttal.yml`. It verifies the
+tagged source, builds a universal app, explicitly signs nested code inside-out,
+creates the drag-to-Applications DMG, submits it to Apple notarization, staples
+the ticket, publishes the DMG and `SHA256SUMS`, and advances the appcast only
+after the release exists.
 
-1. Bump versions and changelog exactly as in the manual flow below
-   (`project.pbxproj`, `scripts/release-macos.sh` default, `CHANGELOG.md`),
-   commit, and push `main`.
-2. `git tag vX.Y.Z && git push origin vX.Y.Z`
+1. Change every app-target `MARKETING_VERSION` and
+   `CURRENT_PROJECT_VERSION` in `macos/Ghostty.xcodeproj/project.pbxproj` to
+   `X.Y.Z` and add `## X.Y.Z` to `CHANGELOG.md`.
+2. Commit and push the clean, tested change to `main`.
+3. Create and push `vX.Y.Z` at that commit.
 
-That's all: `.github/workflows/release-ghosttal.yml` builds, signs,
-notarizes, publishes the GitHub release, and pushes the regenerated
-`appcast.xml` to `main` (pull after it finishes). It needs the six
-repository secrets uploaded once by `scripts/setup-release-secrets.sh`,
-run on a Mac that already has the certificate and Sparkle key.
+The tag must be contained in `main`. Releases are serialized, existing assets
+must byte-match on retries, and the workflow refuses to move the appcast to an
+older version. The signing job uses the protected `release` environment and
+these environment secrets:
 
-## 2b. Cut a Ghosttal release (manually, on a configured Mac)
+- `MACOS_CERTIFICATE_P12` and `MACOS_CERTIFICATE_PASSWORD`
+- `ASC_API_KEY_P8`, `ASC_API_KEY_ID`, and `ASC_API_ISSUER_ID`
+- `SPARKLE_PRIVATE_KEY`
 
-1. Bump versions — all in lockstep, or the release script refuses to run:
-   - `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION` in
-     `macos/Ghostty.xcodeproj/project.pbxproj` (app target blocks).
-     `CURRENT_PROJECT_VERSION` (CFBundleVersion) is what Sparkle compares —
-     it must increase every release.
-   - `RELEASE_VERSION` default in `scripts/release-macos.sh`.
-   - Add a `CHANGELOG.md` entry.
-2. Build, sign, notarize, and regenerate the appcast:
+Run `scripts/setup-release-secrets.sh` from a configured Mac to upload them.
+The helper never deletes the certificate file supplied by the maintainer.
 
-   ```sh
-   ./scripts/release-macos.sh
-   ```
+## Local release
 
-   The script finds the notary profile (`ghosttal-notary` or `notarytool`,
-   or set `NOTARY_PROFILE=`), signs the DMG with the Sparkle EdDSA key from
-   the login keychain, and rewrites `appcast.xml` at the repo root.
-3. Publish, in this order (so the appcast never points at a missing file):
-   1. Commit the version bumps + changelog + `appcast.xml`; do **not** push yet.
-   2. `git tag v<version> && git push origin v<version>`
-   3. `gh release create v<version> dist/Ghosttal-<version>-universal.dmg
-      --title "Ghosttal <version>"`
-   4. `git push origin main` — pushing `appcast.xml` on `main` is what makes
-      installed apps see the update.
+Install Zig 0.16.0, Nushell 0.115.1, Xcode 26, Sparkle 2.9.0 tools, and
+`create-dmg`. Prepare and check out the clean tagged commit, then run:
 
-## The update channel, in one paragraph
+```sh
+RELEASE_VERSION=X.Y.Z ./scripts/release-macos.sh
+```
 
-Installed apps poll
-`https://raw.githubusercontent.com/ccyisafool/ghosttal/main/appcast.xml`
-(hardcoded in `UpdateDelegate.feedURLString`). The appcast points at the DMG
-attached to the matching GitHub release and carries an EdDSA signature made
-with the private key stored in the **login keychain of the release machine**
-(Keychain Access item "Private key for signing Sparkle updates"). Sparkle in
-the installed app verifies that signature against `SUPublicEDKey` baked into
-Info.plist, plus Apple's Developer ID signature. Losing the private key means
-shipped apps will reject future updates — back it up (export with
-`generate_keys -x`, store somewhere safe, import on a new machine with
-`generate_keys -i`). Never commit it to the repository.
+Set `SPARKLE_BIN` or `CREATE_DMG` when those tools are not on their default
+paths. The script accepts either App Store Connect API-key variables or a
+`notarytool` keychain profile (`NOTARY_PROFILE`). It writes the notarized DMG
+and `SHA256SUMS` to `dist/` and regenerates `appcast.xml`.
+
+Publish the DMG and checksum before pushing the appcast. Losing the Sparkle
+private key prevents installed copies from accepting later updates; back it up
+securely and never commit it.

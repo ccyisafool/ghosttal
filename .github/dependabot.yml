@@ -4,5 +4,5 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      # Ghosttal only has one workflow; weekly checks are plenty.
+      # Weekly checks keep pinned workflow actions current without excess noise.
       interval: "weekly"

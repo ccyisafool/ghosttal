@@ -1043,12 +1043,16 @@ pub const StreamHandler = struct {
     /// these protocols enable them after the prompt so they're unaffected.
     fn resetInputProtocols(self: *StreamHandler) !void {
         const t = self.terminal;
+        if (resetInputProtocolState(t)) try self.setMouseShape(.text);
+    }
 
-        if (t.flags.mouse_event != .none) {
-            t.flags.mouse_event = .none;
-            t.flags.mouse_format = .x10;
-            try self.setMouseShape(.text);
-        }
+    /// Reset protocol state without emitting app-runtime messages. Returning
+    /// true tells the caller that mouse tracking was active and the pointer
+    /// shape must be restored as well.
+    fn resetInputProtocolState(t: *terminal.Terminal) bool {
+        const mouse_was_enabled = t.flags.mouse_event != .none;
+        t.flags.mouse_event = .none;
+        t.flags.mouse_format = .x10;
 
         // Keep the DECRQM-visible mode state truthful.
         inline for (.{
@@ -1064,6 +1068,7 @@ pub const StreamHandler = struct {
         }) |mode| t.modes.set(mode, false);
 
         t.screens.active.kitty_keyboard = .{};
+        return mouse_was_enabled;
     }
 
     fn reportPwd(self: *StreamHandler, url: []const u8) !void {
@@ -1500,3 +1505,38 @@ pub const StreamHandler = struct {
         self.surfaceMessageWriter(.{ .progress_report = report });
     }
 };
+
+test "prompt protocol reset clears only input protocol state" {
+    const testing = std.testing;
+    var t = try terminal.Terminal.init(testing.io, testing.allocator, .{
+        .cols = 10,
+        .rows = 10,
+    });
+    defer t.deinit(testing.allocator);
+
+    t.flags.mouse_event = .any;
+    t.flags.mouse_format = .sgr_pixels;
+    t.modes.set(.mouse_event_any, true);
+    t.modes.set(.mouse_format_sgr_pixels, true);
+    t.modes.set(.focus_event, true);
+    t.modes.set(.bracketed_paste, true);
+    t.screens.active.kitty_keyboard.push(.{
+        .disambiguate = true,
+        .report_events = true,
+        .report_alternates = false,
+        .report_all = false,
+        .report_associated = false,
+    });
+
+    try testing.expect(StreamHandler.resetInputProtocolState(&t));
+    try testing.expectEqual(terminal.MouseEvent.none, t.flags.mouse_event);
+    try testing.expectEqual(terminal.MouseFormat.x10, t.flags.mouse_format);
+    try testing.expect(!t.modes.get(.mouse_event_any));
+    try testing.expect(!t.modes.get(.mouse_format_sgr_pixels));
+    try testing.expect(!t.modes.get(.focus_event));
+    try testing.expect(t.modes.get(.bracketed_paste));
+    try testing.expectEqual(@as(u5, 0), t.screens.active.kitty_keyboard.current().int());
+
+    // A second reset is idempotent and does not request a pointer update.
+    try testing.expect(!StreamHandler.resetInputProtocolState(&t));
+}

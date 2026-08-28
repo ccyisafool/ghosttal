@@ -60,7 +60,7 @@ pub fn main(minimal: std.process.Init.Minimal) !MainReturn {
 
     if (comptime builtin.mode == .Debug) {
         std.log.warn("This is a debug build. Performance will be very poor.", .{});
-        std.log.warn("You should only use a debug build for developing Ghostty.", .{});
+        std.log.warn("You should only use a debug build for developing Ghosttal.", .{});
         std.log.warn("Otherwise, please rebuild in a release mode.", .{});
     }
 

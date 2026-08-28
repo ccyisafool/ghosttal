@@ -20,7 +20,7 @@ path: []const u8,
 
 /// Returns the default path for the cache for a given program.
 ///
-/// On all platforms, this is `${XDG_STATE_HOME}/ghostty/ssh_cache`.
+/// On all platforms, Ghosttal uses `${XDG_STATE_HOME}/ghosttal/ssh_cache`.
 ///
 /// The returned value is allocated and must be freed by the caller.
 pub fn defaultPath(

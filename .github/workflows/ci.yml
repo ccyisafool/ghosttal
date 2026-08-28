@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Zig 0.16.0
+        run: |
+          curl -fsSL -o zig.tar.xz https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz
+          echo "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489  zig.tar.xz" | shasum -a 256 -c -
+          mkdir -p "${RUNNER_TEMP}/zig"
+          tar -xJf zig.tar.xz -C "${RUNNER_TEMP}/zig" --strip-components 1
+          echo "${RUNNER_TEMP}/zig" >> "${GITHUB_PATH}"
+
+      - name: Install Nushell 0.115.1
+        run: |
+          curl -fsSL -o nu.tar.gz https://github.com/nushell/nushell/releases/download/0.115.1/nu-0.115.1-aarch64-apple-darwin.tar.gz
+          echo "2e6ed1eb043869ff05b5f2448a8c443e4d3a93557ba4303b21008a0523c96734  nu.tar.gz" | shasum -a 256 -c -
+          mkdir -p "${RUNNER_TEMP}/nu"
+          tar -xzf nu.tar.gz -C "${RUNNER_TEMP}/nu" --strip-components 1
+          echo "${RUNNER_TEMP}/nu" >> "${GITHUB_PATH}"
+
+      - name: Static checks
+        run: |
+          bash -n scripts/*.sh
+          plutil -lint macos/Ghostty-Info.plist
+          zig fmt --check .
+
+      - name: Zig tests
+        run: zig build test
+
+      - name: Shared-core build
+        run: zig build -Demit-macos-app=false
+
+      - name: macOS tests
+        run: ./macos/build.nu --scheme Ghostty --configuration Debug --action test

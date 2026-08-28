@@ -43,3 +43,4 @@ vgcore.*
 
 # Local signed release artifacts are published separately.
 /dist/*.dmg
+/dist/SHA256SUMS

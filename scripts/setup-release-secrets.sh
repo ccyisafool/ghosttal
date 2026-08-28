@@ -48,11 +48,13 @@ read -r -s -p "Password you protected the export with: " CERT_PASSWORD
 echo
 [[ -n "${CERT_PASSWORD}" ]] || { echo "Password must not be empty." >&2; exit 1; }
 
-base64 -i "${CERT_PATH}" | gh secret set MACOS_CERTIFICATE_P12 -R "${REPO}"
+readonly CERT_COPY="${WORK_DIR}/certificate.p12"
+cp -- "${CERT_PATH}" "${CERT_COPY}"
+chmod 600 "${CERT_COPY}"
+base64 -i "${CERT_COPY}" | gh secret set MACOS_CERTIFICATE_P12 -R "${REPO}"
 printf '%s' "${CERT_PASSWORD}" | gh secret set MACOS_CERTIFICATE_PASSWORD -R "${REPO}"
 unset CERT_PASSWORD
-rm -f -- "${CERT_PATH}"
-echo "Certificate uploaded; the local .p12 file has been deleted."
+echo "Certificate uploaded; your original .p12 was left untouched."
 echo
 
 ## 2. Sparkle EdDSA private key -----------------------------------------------

@@ -12,10 +12,18 @@ makes the cursor and newly typed characters easier to track.
 
 ## Download
 
-Ghosttal currently ships as a universal macOS application for Apple silicon and Intel.
+Ghosttal currently supports macOS 13 or later and ships as a universal application for
+Apple silicon and Intel.
 Download the latest notarized DMG from
 [GitHub Releases](https://github.com/ccyisafool/ghosttal/releases/latest), open it, and
 drag `Ghosttal.app` onto the Applications shortcut.
+
+Every release includes `SHA256SUMS`. To verify a downloaded installer:
+
+```sh
+shasum -a 256 -c SHA256SUMS
+spctl --assess --type open --context context:primary-signature --verbose=2 Ghosttal-*.dmg
+```
 
 Ghosttal uses its own bundle identifier and can be installed alongside stock Ghostty.
 
@@ -50,6 +58,10 @@ The cross-platform overlay is `$XDG_CONFIG_HOME/ghosttal/config.ghostty`. Using
 **Ghosttal → Open Configuration** creates or opens the overlay, so motion-only settings
 do not have to alter the configuration used by stock Ghostty.
 
+Ghosttal intentionally reads Ghostty's configuration first for compatibility, but writes
+its own overlay, crash reports, update state, and application data under Ghosttal-specific
+paths. Removing Ghosttal does not remove or rewrite stock Ghostty's configuration.
+
 ## Updates
 
 Use **Ghosttal → Check for Updates…**, or let the automatic background checks run
@@ -78,6 +90,9 @@ zig build test -Dtest-filter=cursor-motion
 ```
 
 Maintainer release process: see [docs/UPSTREAM-SYNC.md](docs/UPSTREAM-SYNC.md).
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution checks and
+[SECURITY.md](SECURITY.md) for private vulnerability reporting.
 
 ## Upstream and attribution
 
