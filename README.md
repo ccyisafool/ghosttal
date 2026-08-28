@@ -49,9 +49,11 @@ do not have to alter the configuration used by stock Ghostty.
 
 ## Updates
 
-Automatic updates are intentionally disabled until Ghosttal has its own signed update
-feed. Ghosttal never consumes Ghostty's Sparkle feed. New releases are published on the
-repository's Releases page.
+Ghosttal updates itself through its own signed Sparkle feed
+(`appcast.xml` on this repository's `main` branch), backed by the DMGs on the
+Releases page. Ghosttal never consumes Ghostty's Sparkle feed. Upstream Ghostty
+changes reach users only after they are merged, tested, and released here — see
+[docs/UPSTREAM-SYNC.md](docs/UPSTREAM-SYNC.md).
 
 ## Building
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.2
+
+- Enable in-app updates via Ghosttal's own Sparkle channel. "Check for
+  Updates…" and automatic checks now poll the appcast served from this
+  repository and never contact Ghostty's update feed.
+- Sign update downloads with a Ghosttal EdDSA key in addition to Developer
+  ID code signing and notarization.
+- Generate and sign the appcast as part of the scripted release flow.
+
 ## 0.1.1
 
 - Add an Applications shortcut to the macOS installer DMG.

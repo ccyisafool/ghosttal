@@ -105,9 +105,9 @@
 		</dict>
 	</array>
 	<key>SUEnableAutomaticChecks</key>
-	<false/>
-	<key>GhosttalUpdatesDisabled</key>
 	<true/>
+	<key>SUPublicEDKey</key>
+	<string>bTxBx6zy5Mqbixec7ou5VpdYDfswKLS2Lx7EYaj+LCU=</string>
 	<key>UTExportedTypeDeclarations</key>
 	<array>
 		<dict>

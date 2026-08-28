@@ -229,7 +229,9 @@ class AppDelegate: NSObject,
         // Initial config loading
         ghosttyConfigDidChange(config: ghostty.config)
 
-        // Ghosttal's updater is intentionally dormant until it has its own feed.
+        // Start our update checker. This only ever talks to Ghosttal's own
+        // feed (see UpdateDelegate.feedURLString), never Ghostty's.
+        updateController.startUpdater()
 
         // Register our service provider. This must happen after everything is initialized.
         NSApp.servicesProvider = ServiceProvider()

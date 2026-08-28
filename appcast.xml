@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>Ghosttal</title>
+    <link>https://github.com/ccyisafool/ghosttal</link>
+    <description>Ghosttal update feed</description>
+    <language>en</language>
+    <item>
+      <title>Ghosttal 0.1.2</title>
+      <pubDate>Fri, 28 Aug 2026 02:13:36 +0000</pubDate>
+      <sparkle:version>0.1.2</sparkle:version>
+      <sparkle:shortVersionString>0.1.2</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <sparkle:releaseNotesLink>https://github.com/ccyisafool/ghosttal/releases/tag/v0.1.2</sparkle:releaseNotesLink>
+      <enclosure url="https://github.com/ccyisafool/ghosttal/releases/download/v0.1.2/Ghosttal-0.1.2-universal.dmg" sparkle:edSignature="uuy4JO1YblCxXEJMT5Y2F0D3zLTjiVX8dkn7XoQ35GFtV2ezJQnKT50nDKzUhz2IN83OkyL0MQRRsPnjS+lbBQ==" length="38293259" type="application/octet-stream"/>
+    </item>
+  </channel>
+</rss>
