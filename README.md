@@ -4,22 +4,25 @@
 </h1>
 
 <p align="center">
-  A motion-focused Ghostty fork with fluid cursor travel and locally echoed input animation.
+  A motion-focused Ghostty fork with fluid cursor motion and animated typing.
 </p>
 
 Ghosttal keeps Ghostty's fast native terminal engine and adds GPU-rendered motion that
-makes the insertion point and newly typed characters easier to track.
+makes the cursor and newly typed characters easier to track.
 
 ## Download
 
 Ghosttal currently ships as a universal macOS application for Apple silicon and Intel.
 Download the latest notarized DMG from
 [GitHub Releases](https://github.com/ccyisafool/ghosttal/releases/latest), open it, and
-copy `Ghosttal.app` to `/Applications`.
+drag `Ghosttal.app` onto the Applications shortcut.
 
 Ghosttal uses its own bundle identifier and can be installed alongside stock Ghostty.
 
 ## Motion controls
+
+All settings are shown with their defaults; put overrides in your Ghosttal overlay
+(see [Configuration](#configuration)):
 
 ```ini
 cursor-motion = smear
@@ -49,6 +52,9 @@ do not have to alter the configuration used by stock Ghostty.
 
 ## Updates
 
+Use **Ghosttal → Check for Updates…**, or let the automatic background checks run
+(controlled by the `auto-update` setting).
+
 Ghosttal updates itself through its own signed Sparkle feed
 (`appcast.xml` on this repository's `main` branch), backed by the DMGs on the
 Releases page. Ghosttal never consumes Ghostty's Sparkle feed. Upstream Ghostty
@@ -57,7 +63,8 @@ changes reach users only after they are merged, tested, and released here — se
 
 ## Building
 
-Install Zig and Nushell, then build the shared core and macOS app:
+Install Zig 0.16.0, Nushell, and Xcode 26 or later, then build the shared core and
+macOS app:
 
 ```sh
 zig build -Demit-macos-app=false -Doptimize=ReleaseFast
