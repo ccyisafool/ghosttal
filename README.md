@@ -70,10 +70,7 @@ Run targeted Zig tests with:
 zig build test -Dtest-filter=cursor-motion
 ```
 
-`scripts/release-macos.sh` performs the universal Release build, Developer ID signing,
-DMG creation, notarization, stapling, and verification. It expects a Developer ID
-Application identity and a `ghosttal-notary` Keychain profile; signing credentials are
-never stored in this repository.
+Maintainer release process: see [docs/UPSTREAM-SYNC.md](docs/UPSTREAM-SYNC.md).
 
 ## Upstream and attribution
 
