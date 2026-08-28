@@ -35,7 +35,7 @@ jobs:
             VERSION="${GITHUB_REF_NAME#v}"
           fi
           [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid version: ${VERSION}" >&2; exit 1; }
-          git fetch origin main "refs/tags/v${VERSION}:refs/tags/v${VERSION}"
+          git fetch origin main --force "refs/tags/v${VERSION}:refs/tags/v${VERSION}"
           git checkout --detach "v${VERSION}"
           git merge-base --is-ancestor HEAD origin/main || {
             echo "Release tag v${VERSION} is not contained in origin/main." >&2
@@ -85,7 +85,7 @@ jobs:
         run: |
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then VERSION="${INPUT_VERSION}"; else VERSION="${GITHUB_REF_NAME#v}"; fi
           [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid version: ${VERSION}" >&2; exit 1; }
-          git fetch origin main "refs/tags/v${VERSION}:refs/tags/v${VERSION}"
+          git fetch origin main --force "refs/tags/v${VERSION}:refs/tags/v${VERSION}"
           git checkout --detach "v${VERSION}"
           git merge-base --is-ancestor HEAD origin/main || { echo "Tag is not contained in origin/main." >&2; exit 1; }
           echo "RELEASE_VERSION=${VERSION}" >> "${GITHUB_ENV}"
