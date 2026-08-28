@@ -316,9 +316,17 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
                     app_version.patch,
                 });
 
-                if (!std.mem.eql(u8, tag, expected)) {
-                    @panic("tagged releases must be in vX.Y.Z format matching build.zig");
-                }
+                // Ghosttal tags its own app releases (vX.Y.Z of the fork)
+                // while the core keeps upstream Ghostty's version, so a tag
+                // that doesn't match build.zig.zon is expected. Build it
+                // like any other development commit instead of refusing.
+                if (!std.mem.eql(u8, tag, expected)) break :version .{
+                    .major = app_version.major,
+                    .minor = app_version.minor,
+                    .patch = app_version.patch,
+                    .pre = vsn.branch,
+                    .build = vsn.short_hash,
+                };
 
                 break :version .{
                     .major = app_version.major,

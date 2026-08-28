@@ -51,6 +51,11 @@ pub const StreamHandler = struct {
     /// The clipboard write access configuration.
     clipboard_write: configpkg.ClipboardAccess,
 
+    /// Whether to reset stale input protocols (mouse reporting, focus
+    /// reporting, Kitty keyboard protocol) when a new shell prompt is
+    /// marked via OSC 133.
+    prompt_input_protocol_reset: bool,
+
     //---------------------------------------------------------------
     // Internal state
 
@@ -105,6 +110,7 @@ pub const StreamHandler = struct {
         self.osc_color_report_format = config.osc_color_report_format;
         self.clipboard_write = config.clipboard_write;
         self.enquiry_response = config.enquiry_response;
+        self.prompt_input_protocol_reset = config.prompt_input_protocol_reset;
         self.terminal.setDefaultCursorStyle(config.cursor_style);
         self.terminal.setDefaultCursorBlink(config.cursor_blink);
 
@@ -1009,12 +1015,19 @@ pub const StreamHandler = struct {
                 self.surfaceMessageWriter(.{ .stop_command = code });
             },
 
+            // A new prompt is a reliable signal that a shell, not a TUI,
+            // is reading input. If a program enabled input protocols and
+            // died without restoring them (e.g. a dropped SSH connection),
+            // reset them now so the prompt isn't flooded with reports the
+            // shell can't parse.
+            .fresh_line_new_prompt,
+            .new_command,
+            => if (self.prompt_input_protocol_reset) try self.resetInputProtocols(),
+
             // Handled by Terminal, no special handling by us
             .end_prompt_start_input,
             .end_prompt_start_input_terminate_eol,
             .fresh_line,
-            .fresh_line_new_prompt,
-            .new_command,
             .prompt_start,
             => {},
         }
@@ -1022,6 +1035,35 @@ pub const StreamHandler = struct {
         // We do this last so failures are still processed correctly
         // above.
         try self.terminal.semanticPrompt(cmd);
+    }
+
+    /// Disable input protocols that a program may have left enabled after
+    /// exiting without restoring them. Called at prompt start (OSC 133;A/N)
+    /// when `prompt-input-protocol-reset` is enabled. Programs that use
+    /// these protocols enable them after the prompt so they're unaffected.
+    fn resetInputProtocols(self: *StreamHandler) !void {
+        const t = self.terminal;
+
+        if (t.flags.mouse_event != .none) {
+            t.flags.mouse_event = .none;
+            t.flags.mouse_format = .x10;
+            try self.setMouseShape(.text);
+        }
+
+        // Keep the DECRQM-visible mode state truthful.
+        inline for (.{
+            .mouse_event_x10,
+            .mouse_event_normal,
+            .mouse_event_button,
+            .mouse_event_any,
+            .mouse_format_utf8,
+            .mouse_format_sgr,
+            .mouse_format_urxvt,
+            .mouse_format_sgr_pixels,
+            .focus_event,
+        }) |mode| t.modes.set(mode, false);
+
+        t.screens.active.kitty_keyboard = .{};
     }
 
     fn reportPwd(self: *StreamHandler, url: []const u8) !void {

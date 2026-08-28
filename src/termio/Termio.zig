@@ -178,6 +178,7 @@ pub const DerivedConfig = struct {
     osc_color_report_format: configpkg.Config.OSCColorReportFormat,
     clipboard_write: configpkg.ClipboardAccess,
     enquiry_response: []const u8,
+    prompt_input_protocol_reset: bool,
     conditional_state: configpkg.ConditionalState,
 
     pub fn init(
@@ -214,6 +215,7 @@ pub const DerivedConfig = struct {
             .osc_color_report_format = config.@"osc-color-report-format",
             .clipboard_write = config.@"clipboard-write",
             .enquiry_response = try alloc.dupe(u8, config.@"enquiry-response"),
+            .prompt_input_protocol_reset = config.@"prompt-input-protocol-reset",
             .conditional_state = config._conditional_state,
 
             // This has to be last so that we copy AFTER the arena allocations
@@ -298,6 +300,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .osc_color_report_format = opts.config.osc_color_report_format,
         .clipboard_write = opts.config.clipboard_write,
         .enquiry_response = opts.config.enquiry_response,
+        .prompt_input_protocol_reset = opts.config.prompt_input_protocol_reset,
     };
 
     const thread_enter_state = try ThreadEnterState.create(

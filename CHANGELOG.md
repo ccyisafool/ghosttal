@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Reset stale input protocols (mouse reporting, focus reporting, and the
+  Kitty keyboard protocol) whenever a new shell prompt is shown, so a
+  dropped SSH session or crashed TUI no longer litters the prompt with
+  unparsed mouse and key reports. Controlled by the new
+  `prompt-input-protocol-reset` option (default on); requires shell
+  integration prompt markers.
+- Allow local development builds at Ghosttal release tags. The build
+  previously refused to run when the git tag did not match upstream
+  Ghostty's core version.
+
 ## 0.1.2
 
 - Enable in-app updates via Ghosttal's own Sparkle channel. "Check for

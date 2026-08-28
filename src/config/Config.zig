@@ -2999,6 +2999,28 @@ keybind: Keybinds = .{},
 /// `xterm-256color` with environment variables if terminfo installation fails.
 @"shell-integration-features": ShellIntegrationFeatures = .{},
 
+/// Reset input protocols when a new shell prompt is shown.
+///
+/// When a program enables mouse reporting or the Kitty keyboard protocol
+/// and then exits without restoring them — a dropped SSH connection being
+/// the classic case — the shell that regains control does not understand
+/// the resulting reports, and moving the mouse litters the prompt with
+/// sequences like `35;69;45M`.
+///
+/// Shells with shell integration mark each new prompt with OSC 133, which
+/// is a reliable signal that a plain shell, not a TUI, is reading input.
+/// When this option is enabled, Ghosttal disables mouse reporting, focus
+/// reporting, and the Kitty keyboard protocol at every prompt start, so
+/// stale protocols self-heal the moment the prompt returns. Programs that
+/// legitimately use these protocols enable them after the prompt is shown
+/// and are unaffected.
+///
+/// This requires shell integration (local or remote) to emit the prompt
+/// markers; without them this option has no effect.
+///
+/// This is a Ghosttal extension. This can be changed at runtime.
+@"prompt-input-protocol-reset": bool = true,
+
 /// Custom entries into the command palette.
 ///
 /// Each entry requires the title, the corresponding action, and an optional
