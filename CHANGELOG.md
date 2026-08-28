@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.3
 
 - Reset stale input protocols (mouse reporting, focus reporting, and the
   Kitty keyboard protocol) whenever a new shell prompt is shown, so a

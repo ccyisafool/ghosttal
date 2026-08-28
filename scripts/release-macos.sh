@@ -3,7 +3,7 @@
 set -euo pipefail
 
 readonly SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-readonly RELEASE_VERSION="${RELEASE_VERSION:-0.1.2}"
+readonly RELEASE_VERSION="${RELEASE_VERSION:-0.1.3}"
 readonly SIGNING_IDENTITY="${SIGNING_IDENTITY:-Developer ID Application: Chenyang Cheng (Y63C8FW5ZK)}"
 readonly OUTPUT_DIR="${OUTPUT_DIR:-${SOURCE_ROOT}/dist}"
 readonly APPCAST_PATH="${APPCAST_PATH:-${SOURCE_ROOT}/appcast.xml}"
