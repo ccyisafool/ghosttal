@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.4
+
+- Sync with the latest upstream Ghostty improvements while preserving
+  Ghosttal's cursor and input animations under the new animation scheduler.
+- Fix shell integration and Xcode launch paths so they invoke the Ghosttal
+  executable correctly.
+- Correct in-app help, update, release-note, commit, comparison, and source
+  links to use the Ghosttal repository.
+- Keep Ghosttal crash reports, SSH cache, and writable application state
+  separate from stock Ghostty.
+- Add a polished drag-to-Applications installer background.
+- Harden signing, notarization, checksums, release retries, protected tags,
+  and Sparkle appcast publishing.
+- Add regression coverage for configuration-overlay precedence and prompt
+  input-protocol cleanup.
+
 ## 0.1.3
 
 - Reset stale input protocols (mouse reporting, focus reporting, and the
