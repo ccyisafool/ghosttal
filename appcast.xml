@@ -6,13 +6,13 @@
     <description>Ghosttal update feed</description>
     <language>en</language>
     <item>
-      <title>Ghosttal 0.1.4</title>
-      <pubDate>Fri, 28 Aug 2026 15:54:05 +0000</pubDate>
-      <sparkle:version>0.1.4</sparkle:version>
-      <sparkle:shortVersionString>0.1.4</sparkle:shortVersionString>
+      <title>Ghosttal 0.1.5</title>
+      <pubDate>Sat, 05 Sep 2026 20:41:17 +0000</pubDate>
+      <sparkle:version>0.1.5</sparkle:version>
+      <sparkle:shortVersionString>0.1.5</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
-      <sparkle:releaseNotesLink>https://github.com/ccyisafool/ghosttal/releases/tag/v0.1.4</sparkle:releaseNotesLink>
-      <enclosure url="https://github.com/ccyisafool/ghosttal/releases/download/v0.1.4/Ghosttal-0.1.4-universal.dmg" sparkle:edSignature="zZcESmAXXVNgqGUKXq2Qs5kNWVlZOq3gjOoMfHlCYkRunPpywiomfEu7kcLvlqB3GVWl9srCpdjQKtUZFStQBQ==" length="34822922" type="application/octet-stream"/>
+      <sparkle:releaseNotesLink>https://github.com/ccyisafool/ghosttal/releases/tag/v0.1.5</sparkle:releaseNotesLink>
+      <enclosure url="https://github.com/ccyisafool/ghosttal/releases/download/v0.1.5/Ghosttal-0.1.5-universal.dmg" sparkle:edSignature="TPQ6Eom7jQ+QbQ3kE9DFNIn3ETf/mPdOcGRkrR5K+y7YGLIAjUy/EznHwXpT2I4q/gixGoPmaOFBdxIE3+eOCw==" length="34822135" type="application/octet-stream"/>
     </item>
   </channel>
 </rss>
