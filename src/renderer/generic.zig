@@ -16,6 +16,7 @@ const link = @import("link.zig");
 const cellpkg = @import("cell.zig");
 const motionpkg = @import("cursor_motion.zig");
 const inputmotion = @import("input_motion.zig");
+const animation_scheduler = @import("animation_scheduler.zig");
 const noMinContrast = cellpkg.noMinContrast;
 const constraintWidth = cellpkg.constraintWidth;
 const isCovering = cellpkg.isCovering;
@@ -1283,10 +1284,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             else
                 self.config.cursor_motion_respect_reduce_motion;
             if (!respect) return false;
-            if (comptime builtin.os.tag == .macos) {
-                return os.macos.accessibilityDisplayShouldReduceMotion();
-            }
-            return false;
+            return os.reduceMotion();
         }
 
         /// The cursor animation clock, in milliseconds since
@@ -1359,11 +1357,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         pub fn animationWake(self: *const Self) ?AnimationWake {
             // Ghosttal cursor and local-input motion are draw-only and are
             // deliberately independent of custom-shader-animation.
-            const motion_delay: ?u64 = if (self.focused and
-                (self.cursorMotionActive() or self.inputMotionActive()))
-                draw_interval_ms
-            else
-                null;
+            const motion_delay = animation_scheduler.motionDelay(.{
+                .visible = self.visible,
+                .focused = self.focused,
+                .cursor_active = self.cursorMotionActive(),
+                .input_active = self.inputMotionActive(),
+            }, draw_interval_ms);
 
             // Custom shaders animate by redrawing on a fixed cadence,
             // gated by configuration and focus.
@@ -1533,13 +1532,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
             }
 
-            const should_run =
-                // Non-visible windows never vsync
-                self.visible and
-                // Non-focused windows only render on-demand
-                self.focused and
-                // Only vsync if we have cell changes or animation
-                (self.cells_rebuilt or self.animationWake() != null);
+            const should_run = animation_scheduler.displayLinkShouldRun(
+                self.visible,
+                self.focused,
+                self.cells_rebuilt,
+                self.animationWake() != null,
+            );
 
             if (should_run) {
                 if (!display_link.isRunning()) {

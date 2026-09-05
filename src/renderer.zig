@@ -15,6 +15,7 @@ const cursor = @import("renderer/cursor.zig");
 // the test graph.
 const cursor_motion = @import("renderer/cursor_motion.zig");
 const input_motion = @import("renderer/input_motion.zig");
+const animation_scheduler = @import("renderer/animation_scheduler.zig");
 const message = @import("renderer/message.zig");
 const size = @import("renderer/size.zig");
 pub const shadertoy = @import("renderer/shadertoy.zig");
@@ -65,6 +66,7 @@ test {
     _ = cursor;
     _ = cursor_motion;
     _ = input_motion;
+    _ = animation_scheduler;
     _ = message;
     _ = shadertoy;
     _ = size;

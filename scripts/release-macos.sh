@@ -112,12 +112,7 @@ fi
 }
 readonly SPARKLE_BIN
 
-for setting in MARKETING_VERSION CURRENT_PROJECT_VERSION; do
-  grep -Fq "${setting} = ${RELEASE_VERSION};" "${SOURCE_ROOT}/macos/Ghostty.xcodeproj/project.pbxproj" || {
-    echo "${setting} does not include RELEASE_VERSION=${RELEASE_VERSION}" >&2
-    exit 1
-  }
-done
+"${SOURCE_ROOT}/scripts/verify-macos-version-settings.sh" "${RELEASE_VERSION}"
 security find-identity -v -p codesigning | grep -Fq "${SIGNING_IDENTITY}" || {
   echo "Signing identity is unavailable: ${SIGNING_IDENTITY}" >&2
   exit 1
@@ -131,17 +126,8 @@ zig build -Demit-macos-app=false -Doptimize=ReleaseFast
 ./macos/build.nu --scheme Ghostty --configuration Release --action build
 
 [[ -d "${APP_PATH}" ]] || { echo "Release app was not produced at ${APP_PATH}" >&2; exit 1; }
-readonly BUILT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${APP_PATH}/Contents/Info.plist")"
-readonly BUILT_NUMBER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "${APP_PATH}/Contents/Info.plist")"
-[[ "${BUILT_VERSION}" == "${RELEASE_VERSION}" && "${BUILT_NUMBER}" == "${RELEASE_VERSION}" ]] || {
-  echo "Built app version ${BUILT_VERSION} (${BUILT_NUMBER}) does not match ${RELEASE_VERSION}." >&2
-  exit 1
-}
+"${STAGE_ROOT}/scripts/verify-macos-app.sh" "${APP_PATH}" "${RELEASE_VERSION}"
 readonly APP_ARCHS="$(lipo -archs "${APP_PATH}/Contents/MacOS/ghosttal")"
-[[ " ${APP_ARCHS} " == *" arm64 "* && " ${APP_ARCHS} " == *" x86_64 "* ]] || {
-  echo "Expected a universal app; found architectures: ${APP_ARCHS}" >&2
-  exit 1
-}
 
 # Sign Sparkle helpers and other nested code from the inside out, then the app.
 readonly SPARKLE_FRAMEWORK="${APP_PATH}/Contents/Frameworks/Sparkle.framework"

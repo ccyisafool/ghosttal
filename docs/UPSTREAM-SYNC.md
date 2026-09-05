@@ -34,6 +34,7 @@ zig fmt --check .
 zig build test
 zig build -Demit-macos-app=false
 ./macos/build.nu --scheme Ghostty --configuration Debug --action test
+./scripts/release-preflight.sh
 ```
 
 Also launch a Debug app and manually exercise cursor/input motion, Reduce
@@ -41,7 +42,10 @@ Motion, the Ghostty-base/Ghosttal-overlay precedence, links, and update checks.
 
 ## Automated release
 
-The preferred path is `.github/workflows/release-ghosttal.yml`. It verifies the
+The credential-free `scripts/release-preflight.sh` command first exercises the
+ReleaseFast core, unsigned Release app, all app-target versions, and universal
+architectures for both the main executable and embedded DockTilePlugin. The
+preferred publishing path is `.github/workflows/release-ghosttal.yml`. It verifies the
 tagged source, builds a universal app, explicitly signs nested code inside-out,
 creates the drag-to-Applications DMG, submits it to Apple notarization, staples
 the ticket, publishes the DMG and `SHA256SUMS`, and advances the appcast only

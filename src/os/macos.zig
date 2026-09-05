@@ -16,16 +16,6 @@ pub fn isAtLeastVersion(major: i64, minor: i64, patch: i64) bool {
     });
 }
 
-/// AppKit's system accessibility preference. Callers are expected to guard
-/// this with a macOS comptime branch; keeping it here makes non-macOS builds
-/// entirely free of Objective-C/AppKit references.
-pub fn accessibilityDisplayShouldReduceMotion() bool {
-    comptime assert(builtin.target.os.tag == .macos);
-    const NSWorkspace = objc.getClass("NSWorkspace") orelse return false;
-    const workspace = NSWorkspace.msgSend(objc.Object, objc.sel("sharedWorkspace"), .{});
-    return workspace.msgSend(bool, objc.sel("accessibilityDisplayShouldReduceMotion"), .{});
-}
-
 pub const AppSupportDirError = Allocator.Error || error{AppleAPIFailed};
 
 /// Return the path to the application support directory for Ghostty

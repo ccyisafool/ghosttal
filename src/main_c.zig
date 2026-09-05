@@ -176,6 +176,12 @@ pub export fn ghostty_string_free(str: String) void {
     str.deinit();
 }
 
+/// Update the process-wide Reduce Motion cache from the native app runtime.
+/// Render threads read this atomically and never call AppKit themselves.
+pub export fn ghostty_set_reduce_motion(enabled: bool) void {
+    internal_os.setReduceMotion(enabled);
+}
+
 // On Windows, Zig's _DllMainCRTStartup does not initialize the MSVC C
 // runtime when targeting MSVC ABI. Without initialization, any C library
 // function that depends on CRT internal state (setlocale, malloc from C

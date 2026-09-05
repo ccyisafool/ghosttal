@@ -14,6 +14,7 @@ const mouse = @import("mouse.zig");
 const openpkg = @import("open.zig");
 const pipepkg = @import("pipe.zig");
 const resourcesdir = @import("resourcesdir.zig");
+const reduce_motion = @import("reduce_motion.zig");
 const systemd = @import("systemd.zig");
 const kernel_info = @import("kernel_info.zig");
 
@@ -54,6 +55,8 @@ pub const OpenType = openpkg.Type;
 pub const pipe = pipepkg.pipe;
 pub const resourcesDir = resourcesdir.resourcesDir;
 pub const ResourcesDir = resourcesdir.ResourcesDir;
+pub const reduceMotion = reduce_motion.get;
+pub const setReduceMotion = reduce_motion.set;
 pub const ShellEscapeWriter = shell.ShellEscapeWriter;
 pub const getKernelInfo = kernel_info.getKernelInfo;
 pub const getConfigEditCommand = edit.getConfigEditCommand;
@@ -66,6 +69,7 @@ test {
     _ = path;
     _ = uri;
     _ = shell;
+    _ = reduce_motion;
 
     if (comptime builtin.os.tag == .linux) {
         _ = kernel_info;

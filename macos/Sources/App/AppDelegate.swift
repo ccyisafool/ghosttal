@@ -181,6 +181,10 @@ class AppDelegate: NSObject,
         super.init()
 
         ghostty.delegate = self
+
+        // Seed the renderer's lock-free accessibility cache before any
+        // terminal surface can draw.
+        ghostty_set_reduce_motion(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
     }
 
     // MARK: - NSApplicationDelegate
@@ -268,6 +272,12 @@ class AppDelegate: NSObject,
             self,
             selector: #selector(keyboardSelectionDidChange(_:)),
             name: NSTextInputContext.keyboardSelectionDidChangeNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(accessibilityDisplayOptionsDidChange(_:)),
+            name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
             object: nil
         )
         NotificationCenter.default.addObserver(
@@ -659,6 +669,10 @@ class AppDelegate: NSObject,
     @MainActor @objc private func keyboardSelectionDidChange(_ notification: Notification) {
         syncMenuShortcuts(ghostty.config)
         TerminalController.all.forEach { $0.relabelTabs() }
+    }
+
+    @objc private func accessibilityDisplayOptionsDidChange(_ notification: Notification) {
+        ghostty_set_reduce_motion(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
     }
 
     @objc private func ghosttyBellDidRing(_ notification: Notification) {

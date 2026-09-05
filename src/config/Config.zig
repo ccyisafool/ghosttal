@@ -4228,61 +4228,92 @@ fn writeConfigTemplate(path: []const u8) !void {
 /// This lets an existing Ghostty setup work unchanged while keeping
 /// Ghosttal-only motion preferences out of Ghostty's own configuration.
 pub fn loadDefaultFiles(self: *Config, alloc: Allocator) !void {
-    var any_loaded = false;
+    var layers: [4]DefaultFilePair = undefined;
+    var layer_count: usize = 0;
 
     // Ghostty's XDG config is the first base layer on every platform.
     const legacy_xdg_path = try file_load.legacyDefaultXdgPath(alloc);
     defer alloc.free(legacy_xdg_path);
     const xdg_path = try file_load.defaultXdgPath(alloc);
     defer alloc.free(xdg_path);
-    any_loaded = self.loadDefaultFilePair(alloc, legacy_xdg_path, xdg_path) or any_loaded;
-
-    // On macOS, inherit Ghostty's Application Support config as another base
-    // layer. This remains explicit even though Ghosttal has its own bundle ID.
-    if (comptime builtin.os.tag == .macos) {
-        const ghostty_legacy_app_support = try file_load.ghosttyLegacyDefaultAppSupportPath(alloc);
-        defer alloc.free(ghostty_legacy_app_support);
-        const ghostty_app_support = try file_load.ghosttyDefaultAppSupportPath(alloc);
-        defer alloc.free(ghostty_app_support);
-        any_loaded = self.loadDefaultFilePair(
-            alloc,
-            ghostty_legacy_app_support,
-            ghostty_app_support,
-        ) or any_loaded;
-    }
+    layers[layer_count] = .{ .legacy_path = legacy_xdg_path, .path = xdg_path };
+    layer_count += 1;
 
     // Ghosttal's XDG config overlays every stock Ghostty config.
     const ghosttal_legacy_xdg = try file_load.ghosttalLegacyDefaultXdgPath(alloc);
     defer alloc.free(ghosttal_legacy_xdg);
     const ghosttal_xdg = try file_load.ghosttalDefaultXdgPath(alloc);
     defer alloc.free(ghosttal_xdg);
-    any_loaded = self.loadDefaultFilePair(
-        alloc,
-        ghosttal_legacy_xdg,
-        ghosttal_xdg,
-    ) or any_loaded;
 
     if (comptime builtin.os.tag == .macos) {
+        // Keep these paths alive through loadDefaultFileLayers. Defers inside a
+        // separate macOS block would free them before the layers are consumed.
+        const ghostty_legacy_app_support = try file_load.ghosttyLegacyDefaultAppSupportPath(alloc);
+        defer alloc.free(ghostty_legacy_app_support);
+        const ghostty_app_support = try file_load.ghosttyDefaultAppSupportPath(alloc);
+        defer alloc.free(ghostty_app_support);
+        layers[layer_count] = .{
+            .legacy_path = ghostty_legacy_app_support,
+            .path = ghostty_app_support,
+        };
+        layer_count += 1;
+
+        layers[layer_count] = .{
+            .legacy_path = ghosttal_legacy_xdg,
+            .path = ghosttal_xdg,
+        };
+        layer_count += 1;
+
         // The Ghosttal Application Support config is the final, highest-priority
         // default layer on macOS.
         const ghosttal_legacy_app_support = try file_load.legacyDefaultAppSupportPath(alloc);
         defer alloc.free(ghosttal_legacy_app_support);
         const ghosttal_app_support = try file_load.defaultAppSupportPath(alloc);
         defer alloc.free(ghosttal_app_support);
-        any_loaded = self.loadDefaultFilePair(
-            alloc,
-            ghosttal_legacy_app_support,
-            ghosttal_app_support,
-        ) or any_loaded;
+        layers[layer_count] = .{
+            .legacy_path = ghosttal_legacy_app_support,
+            .path = ghosttal_app_support,
+        };
+        layer_count += 1;
 
-        if (!any_loaded) writeConfigTemplate(ghosttal_app_support) catch |err| {
+        if (!self.loadDefaultFileLayers(alloc, layers[0..layer_count])) writeConfigTemplate(ghosttal_app_support) catch |err| {
             log.warn("error creating Ghosttal template config file err={}", .{err});
         };
-    } else if (!any_loaded) {
-        writeConfigTemplate(ghosttal_xdg) catch |err| {
+    } else {
+        layers[layer_count] = .{
+            .legacy_path = ghosttal_legacy_xdg,
+            .path = ghosttal_xdg,
+        };
+        layer_count += 1;
+
+        if (!self.loadDefaultFileLayers(alloc, layers[0..layer_count])) writeConfigTemplate(ghosttal_xdg) catch |err| {
             log.warn("error creating Ghosttal template config file err={}", .{err});
         };
     }
+}
+
+const DefaultFilePair = struct {
+    legacy_path: []const u8,
+    path: []const u8,
+};
+
+/// Load already-resolved default paths in their declared order. Separating
+/// path discovery from precedence makes the complete layering contract
+/// deterministic and testable without modifying a user's home directory.
+fn loadDefaultFileLayers(
+    self: *Config,
+    alloc: Allocator,
+    layers: []const DefaultFilePair,
+) bool {
+    var any_loaded = false;
+    for (layers) |layer| {
+        any_loaded = self.loadDefaultFilePair(
+            alloc,
+            layer.legacy_path,
+            layer.path,
+        ) or any_loaded;
+    }
+    return any_loaded;
 }
 
 fn loadDefaultFilePair(
@@ -4339,6 +4370,51 @@ test "Ghosttal config overlay wins over Ghostty base" {
     try testing.expect(cfg.loadDefaultFilePair(alloc, missing, overlay));
     try testing.expectEqual(CursorMotion.spring, cfg.@"cursor-motion");
     try testing.expect(cfg.@"input-motion");
+}
+
+test "default config layers load in complete precedence order" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var td = try internal_os.TempDir.init();
+    defer td.deinit();
+
+    var writer_buf: [256]u8 = undefined;
+    var name_bufs: [8][32]u8 = undefined;
+    var path_bufs: [8][std.fs.max_path_bytes]u8 = undefined;
+    var paths: [8][]const u8 = undefined;
+    for (0..paths.len) |i| {
+        const name = try std.fmt.bufPrint(&name_bufs[i], "layer-{d}", .{i + 1});
+        var file = try td.dir.createFile(testing.io, name, .{});
+        defer file.close(testing.io);
+        var writer = file.writer(testing.io, &writer_buf);
+        try writer.interface.print("cursor-motion-duration = {d}\n", .{i + 1});
+        try writer.end();
+        const path_len = try td.dir.realPathFile(testing.io, name, &path_bufs[i]);
+        paths[i] = path_bufs[i][0..path_len];
+    }
+
+    var missing_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const missing = try std.fmt.bufPrint(&missing_buf, "{s}.missing", .{paths[0]});
+
+    // Every prefix should leave the final existing file authoritative. This
+    // verifies both legacy-before-current ordering and all four base/overlay
+    // layers used on macOS.
+    for (1..paths.len + 1) |prefix_len| {
+        var layers: [4]DefaultFilePair = undefined;
+        for (&layers, 0..) |*layer, i| {
+            const legacy_index = i * 2;
+            const current_index = legacy_index + 1;
+            layer.* = .{
+                .legacy_path = if (legacy_index < prefix_len) paths[legacy_index] else missing,
+                .path = if (current_index < prefix_len) paths[current_index] else missing,
+            };
+        }
+
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try testing.expect(cfg.loadDefaultFileLayers(alloc, &layers));
+        try testing.expectEqual(@as(u32, @intCast(prefix_len)), cfg.@"cursor-motion-duration");
+    }
 }
 
 /// Load and parse the CLI args.

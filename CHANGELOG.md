@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.5
+
+- Make cursor and input animation scheduling visibility- and focus-aware so
+  hidden or inactive surfaces stop requesting animation frames and resume
+  cleanly when shown again.
+- Track macOS Reduce Motion changes through a lock-free renderer cache instead
+  of calling AppKit from frame-critical render paths.
+- Make Ghostty-base and Ghosttal-overlay configuration precedence deterministic
+  and add complete layer-order regression coverage.
+- Strengthen release validation for versions, universal app and Dock Tile
+  Plugin architectures, Swift linting, and credential-free release preflight.
+- Preserve an explicitly selected Xcode toolchain throughout nested macOS build
+  and test commands.
+
 ## 0.1.4
 
 - Sync with the latest upstream Ghostty improvements while preserving
