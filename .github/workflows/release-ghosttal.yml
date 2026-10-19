@@ -120,8 +120,8 @@ jobs:
           tar -xzf nu.tar.gz -C "${RUNNER_TEMP}/nu" --strip-components 1
           echo "${RUNNER_TEMP}/nu" >> "${GITHUB_PATH}"
 
-          curl -fsSL -o sparkle.tar.xz https://github.com/sparkle-project/Sparkle/releases/download/2.9.0/Sparkle-2.9.0.tar.xz
-          echo "01e0f0ebf6614061ea816d414de50f937d64ffa6822ad572243031ca3676fe19  sparkle.tar.xz" | shasum -a 256 -c -
+          curl -fsSL -o sparkle.tar.xz https://github.com/sparkle-project/Sparkle/releases/download/2.9.6/Sparkle-2.9.6.tar.xz
+          echo "52bf9e88cdd972fc0c81501377a880e90d47031bd8ca5462488f843e2609e192  sparkle.tar.xz" | shasum -a 256 -c -
           mkdir -p "${RUNNER_TEMP}/sparkle"
           tar -xJf sparkle.tar.xz -C "${RUNNER_TEMP}/sparkle"
           echo "SPARKLE_BIN=${RUNNER_TEMP}/sparkle/bin" >> "${GITHUB_ENV}"
@@ -246,8 +246,8 @@ jobs:
 
       - name: Install pinned Sparkle tools
         run: |
-          curl -fsSL -o sparkle.tar.xz https://github.com/sparkle-project/Sparkle/releases/download/2.9.0/Sparkle-2.9.0.tar.xz
-          echo "01e0f0ebf6614061ea816d414de50f937d64ffa6822ad572243031ca3676fe19  sparkle.tar.xz" | shasum -a 256 -c -
+          curl -fsSL -o sparkle.tar.xz https://github.com/sparkle-project/Sparkle/releases/download/2.9.6/Sparkle-2.9.6.tar.xz
+          echo "52bf9e88cdd972fc0c81501377a880e90d47031bd8ca5462488f843e2609e192  sparkle.tar.xz" | shasum -a 256 -c -
           mkdir -p "${RUNNER_TEMP}/sparkle"
           tar -xJf sparkle.tar.xz -C "${RUNNER_TEMP}/sparkle"
           echo "SPARKLE_BIN=${RUNNER_TEMP}/sparkle/bin" >> "${GITHUB_ENV}"

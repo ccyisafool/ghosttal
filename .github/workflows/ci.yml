@@ -56,6 +56,9 @@ jobs:
       - name: Zig tests
         run: zig build test
 
+      - name: Bash integration tests
+        run: python3 scripts/test-bash-integration.py
+
       - name: Shared-core build
         run: zig build -Demit-macos-app=false
 

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.6
+
+- Update and exactly pin Sparkle to 2.9.6, including the release signing tools,
+  to pick up upstream installer security fixes.
+- Fix terminal memory errors when narrowing across a wide character and when
+  scrollback pruning replaces the cursor page on a one-row surface.
+- Coalesce output in unfocused windows at vsync without enabling background
+  cursor or input motion.
+- Fix Find Previous searching forward and theme-picker crashes when no themes
+  match a search.
+- Preserve failed command exit statuses in Bash shell-integration markers.
+- Correct the selection foreground/background colors supplied to custom shaders.
+- Preserve the last animated typed glyph when terminal focus changes.
+- Resolve inherited Ghostty configuration includes before the Ghosttal overlay,
+  preserving overlay and CLI precedence across nested base files.
+- Allow macOS OpenGL builds and tests without compiling unused Metal shaders.
+
 ## 0.1.5
 
 - Make cursor and input animation scheduling visibility- and focus-aware so

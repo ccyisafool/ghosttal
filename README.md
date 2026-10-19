@@ -48,7 +48,8 @@ macOS Reduce Motion by default.
 ## Configuration
 
 Ghosttal loads an existing Ghostty configuration as its base, then applies an optional
-Ghosttal overlay. On macOS the overlay is:
+Ghosttal overlay. Included files in the Ghostty base are resolved before the overlay,
+so they cannot overwrite its settings. On macOS the overlay is:
 
 ```text
 ~/Library/Application Support/com.chenyangcheng.ghosttal/config.ghostty

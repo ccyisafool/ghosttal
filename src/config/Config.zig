@@ -2644,6 +2644,9 @@ keybind: Keybinds = .{},
 /// If "foo" contains `a = 2`, the final value of `a` will be 2, because
 /// `foo` is loaded after the configuration file that configures the
 /// nested `config-file` value.
+///
+/// Ghosttal resolves includes from the inherited Ghostty base before loading
+/// its own overlay. Overlay and CLI includes retain the ordering above.
 @"config-file": RepeatablePath = .{},
 
 /// When this is true, the default configuration file paths will be loaded.
@@ -4022,6 +4025,11 @@ _conditional_set: std.EnumSet(conditional.Key) = .{},
 /// as loadTheme which has more details on why.
 _replay_steps: std.ArrayList(Replay.Step) = .empty,
 
+/// Includes already resolved by an earlier loading phase. Ghostty's base
+/// includes must finish before Ghosttal overlays; the final recursive pass
+/// must not reapply them over the overlay or CLI values. Arena-owned.
+_recursive_files_loaded: std.StringHashMapUnmanaged(void) = .{},
+
 /// Set to true if Ghostty was executed as xdg-terminal-exec on Linux.
 @"_xdg-terminal-exec": bool = false,
 
@@ -4033,10 +4041,10 @@ pub fn deinit(self: *Config) void {
 /// Load the configuration according to the default rules:
 ///
 ///   1. Defaults
-///   2. XDG config dir
-///   3. "Application Support" directory (macOS only)
+///   2. Ghostty base files and their recursive includes
+///   3. Ghosttal overlay files
 ///   4. CLI flags
-///   5. Recursively defined configuration files
+///   5. Remaining overlay/CLI recursive includes
 ///
 pub fn load(alloc_gpa: Allocator) !Config {
     var result = try default(alloc_gpa);
@@ -4261,6 +4269,7 @@ pub fn loadDefaultFiles(self: *Config, alloc: Allocator) !void {
         layers[layer_count] = .{
             .legacy_path = ghosttal_legacy_xdg,
             .path = ghosttal_xdg,
+            .overlay = true,
         };
         layer_count += 1;
 
@@ -4273,20 +4282,22 @@ pub fn loadDefaultFiles(self: *Config, alloc: Allocator) !void {
         layers[layer_count] = .{
             .legacy_path = ghosttal_legacy_app_support,
             .path = ghosttal_app_support,
+            .overlay = true,
         };
         layer_count += 1;
 
-        if (!self.loadDefaultFileLayers(alloc, layers[0..layer_count])) writeConfigTemplate(ghosttal_app_support) catch |err| {
+        if (!try self.loadDefaultFileLayers(alloc, layers[0..layer_count])) writeConfigTemplate(ghosttal_app_support) catch |err| {
             log.warn("error creating Ghosttal template config file err={}", .{err});
         };
     } else {
         layers[layer_count] = .{
             .legacy_path = ghosttal_legacy_xdg,
             .path = ghosttal_xdg,
+            .overlay = true,
         };
         layer_count += 1;
 
-        if (!self.loadDefaultFileLayers(alloc, layers[0..layer_count])) writeConfigTemplate(ghosttal_xdg) catch |err| {
+        if (!try self.loadDefaultFileLayers(alloc, layers[0..layer_count])) writeConfigTemplate(ghosttal_xdg) catch |err| {
             log.warn("error creating Ghosttal template config file err={}", .{err});
         };
     }
@@ -4295,6 +4306,7 @@ pub fn loadDefaultFiles(self: *Config, alloc: Allocator) !void {
 const DefaultFilePair = struct {
     legacy_path: []const u8,
     path: []const u8,
+    overlay: bool = false,
 };
 
 /// Load already-resolved default paths in their declared order. Separating
@@ -4304,9 +4316,14 @@ fn loadDefaultFileLayers(
     self: *Config,
     alloc: Allocator,
     layers: []const DefaultFilePair,
-) bool {
+) !bool {
     var any_loaded = false;
+    var overlays_started = false;
     for (layers) |layer| {
+        if (layer.overlay and !overlays_started) {
+            try self.loadRecursiveFiles(alloc);
+            overlays_started = true;
+        }
         any_loaded = self.loadDefaultFilePair(
             alloc,
             layer.legacy_path,
@@ -4372,6 +4389,111 @@ test "Ghosttal config overlay wins over Ghostty base" {
     try testing.expect(cfg.@"input-motion");
 }
 
+test "Ghosttal overlay and CLI override nested Ghostty base includes" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var td = try internal_os.TempDir.init();
+    defer td.deinit();
+
+    const files = [_]struct { name: []const u8, contents: []const u8 }{
+        .{ .name = "base", .contents = "font-size = 10\nconfig-file = base-include\nconfig-file = ?missing\n" },
+        .{ .name = "base-include", .contents = "font-size = 11\nconfig-file = base-nested\nbackground = 112233\n" },
+        .{ .name = "base-nested", .contents = "font-size = 12\n" },
+        .{ .name = "overlay", .contents = "font-size = 20\n" },
+        .{ .name = "overlay-with-include", .contents = "font-size = 20\nconfig-file = overlay-include\n" },
+        .{ .name = "overlay-include", .contents = "font-size = 21\n" },
+        .{ .name = "cli-include", .contents = "font-size = 40\n" },
+        .{ .name = "theme", .contents = "font-size = 5\n" },
+    };
+    var path_bufs: [files.len][std.fs.max_path_bytes]u8 = undefined;
+    var paths: [files.len][]const u8 = undefined;
+    for (files, 0..) |file_data, i| {
+        const file = try td.dir.createFile(testing.io, file_data.name, .{});
+        defer file.close(testing.io);
+        var buf: [256]u8 = undefined;
+        var writer = file.writer(testing.io, &buf);
+        try writer.interface.writeAll(file_data.contents);
+        try writer.end();
+        paths[i] = path_bufs[i][0..try td.dir.realPathFile(testing.io, file_data.name, &path_bufs[i])];
+    }
+    const cli_include = try std.fmt.allocPrint(alloc, "--config-file={s}", .{paths[6]});
+    defer alloc.free(cli_include);
+    const theme_arg = try std.fmt.allocPrint(alloc, "--theme={s}", .{paths[7]});
+    defer alloc.free(theme_arg);
+    const missing = try std.fs.path.join(alloc, &.{ std.fs.path.dirname(paths[0]).?, "missing" });
+    defer alloc.free(missing);
+    const cases = [_]struct { overlay_index: usize = 3, args: []const []const u8 = &.{}, expected: f32 }{
+        .{ .expected = 20 },
+        .{ .overlay_index = 4, .expected = 21 },
+        .{ .args = &.{"--font-size=30"}, .expected = 30 },
+        .{ .args = &.{cli_include}, .expected = 40 },
+        // Resetting the include list must not cause old base files to reload.
+        .{ .args = &.{ "--config-file=", "--font-size=30" }, .expected = 30 },
+    };
+    for (cases) |case| {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var theme_it: TestIterator = .{ .data = &.{theme_arg} };
+        try cfg.loadIter(alloc, &theme_it);
+        const layers = [_]DefaultFilePair{
+            .{ .legacy_path = missing, .path = paths[0] },
+            .{ .legacy_path = missing, .path = paths[case.overlay_index], .overlay = true },
+        };
+        try testing.expect(try cfg.loadDefaultFileLayers(alloc, &layers));
+        var it: TestIterator = .{ .data = case.args };
+        try cfg.loadIter(alloc, &it);
+        try cfg.loadRecursiveFiles(alloc);
+        try cfg.finalize();
+        try testing.expectEqual(case.expected, cfg.@"font-size");
+        try testing.expectEqual(@as(u8, 0x11), cfg.background.r);
+        try testing.expect(cfg._diagnostics.empty());
+
+        var cloned = try cfg.clone(alloc);
+        defer cloned.deinit();
+        try cloned.loadRecursiveFiles(alloc);
+        try testing.expectEqual(case.expected, cloned.@"font-size");
+        try testing.expect(cloned._diagnostics.empty());
+
+        var replayed = try cfg.cloneEmpty(alloc);
+        defer replayed.deinit();
+        var replay = Replay.iterator(cfg._replay_steps.items, &replayed);
+        try replayed.loadIter(alloc, &replay);
+        try testing.expectEqual(case.expected, replayed.@"font-size");
+    }
+}
+
+test "Ghosttal base include cycles retain diagnostics across loading phases" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var td = try internal_os.TempDir.init();
+    defer td.deinit();
+
+    const file = try td.dir.createFile(testing.io, "cycle", .{});
+    defer file.close(testing.io);
+    var buf: [256]u8 = undefined;
+    var writer = file.writer(testing.io, &buf);
+    try writer.interface.writeAll("config-file = cycle\nfont-size = 10\n");
+    try writer.end();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try td.dir.realPathFile(testing.io, "cycle", &path_buf)];
+    const missing = try std.fs.path.join(alloc, &.{ std.fs.path.dirname(path).?, "missing" });
+    defer alloc.free(missing);
+    const layers = [_]DefaultFilePair{
+        .{ .legacy_path = missing, .path = path },
+        .{ .legacy_path = missing, .path = missing, .overlay = true },
+    };
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    try testing.expect(try cfg.loadDefaultFileLayers(alloc, &layers));
+    try testing.expectEqual(@as(usize, 1), cfg._diagnostics.items().len);
+    var it: TestIterator = .{ .data = &.{"--font-size=20"} };
+    try cfg.loadIter(alloc, &it);
+    try cfg.loadRecursiveFiles(alloc);
+    try testing.expectEqual(@as(f32, 20), cfg.@"font-size");
+    try testing.expectEqual(@as(usize, 1), cfg._diagnostics.items().len);
+}
+
 test "default config layers load in complete precedence order" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -4412,7 +4534,7 @@ test "default config layers load in complete precedence order" {
 
         var cfg = try Config.default(alloc);
         defer cfg.deinit();
-        try testing.expect(cfg.loadDefaultFileLayers(alloc, &layers));
+        try testing.expect(try cfg.loadDefaultFileLayers(alloc, &layers));
         try testing.expectEqual(@as(u32, @intCast(prefix_len)), cfg.@"cursor-motion-duration");
     }
 }
@@ -4569,6 +4691,11 @@ pub fn loadRecursiveFiles(self: *Config, alloc_gpa: Allocator) !void {
         // they're fixed up after each load.
         assert(std.fs.path.isAbsolute(path));
 
+        // Earlier phases have already applied these includes. Keep the
+        // per-pass set below separate so cycles within a phase still emit
+        // diagnostics instead of being silently skipped.
+        if (self._recursive_files_loaded.contains(path)) continue;
+
         // We must only load a unique file once
         if (try loaded.fetchPut(path, {}) != null) {
             const diag: cli.Diagnostic = .{
@@ -4623,6 +4750,11 @@ pub fn loadRecursiveFiles(self: *Config, alloc_gpa: Allocator) !void {
         }
 
         try self.loadFsFile(arena_alloc, &file, path);
+    }
+
+    var loaded_paths = loaded.keyIterator();
+    while (loaded_paths.next()) |path| {
+        try self._recursive_files_loaded.put(arena_alloc, try arena_alloc.dupe(u8, path.*), {});
     }
 
     // If we have a suffix, add that back.
@@ -4692,6 +4824,7 @@ pub fn changeConditionalState(
     var it = Replay.iterator(self._replay_steps.items, &new_config);
     try new_config.loadIter(alloc_gpa, &it);
     try new_config.finalize();
+    try self.copyRecursiveFileState(&new_config);
 
     return new_config;
 }
@@ -4844,6 +4977,7 @@ fn loadTheme(self: *Config, theme: Theme) !void {
     // from the theme.
     var slice_it = Replay.iterator(self._replay_steps.items, &new_config);
     try new_config.loadIter(alloc_gpa, &slice_it);
+    try self.copyRecursiveFileState(&new_config);
 
     // Success, swap our new config in and free the old.
     self.deinit();
@@ -5321,7 +5455,19 @@ pub fn clone(
     // Copy the conditional set
     result._conditional_set = self._conditional_set;
 
+    try self.copyRecursiveFileState(&result);
+
     return result;
+}
+
+/// Replaying values does not reopen include files. Preserve their completed
+/// state when cloning or rebuilding for a theme/conditional change as well.
+fn copyRecursiveFileState(self: *const Config, dst: *Config) Allocator.Error!void {
+    const alloc = dst._arena.?.allocator();
+    var paths = self._recursive_files_loaded.keyIterator();
+    while (paths.next()) |path| {
+        try dst._recursive_files_loaded.put(alloc, try alloc.dupe(u8, path.*), {});
+    }
 }
 
 fn cloneValue(

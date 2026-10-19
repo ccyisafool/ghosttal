@@ -18,11 +18,12 @@ pub fn motionDelay(state: MotionState, interval_ms: u64) ?u64 {
 
 pub fn displayLinkShouldRun(
     visible: bool,
-    focused: bool,
     cells_rebuilt: bool,
     animation_pending: bool,
 ) bool {
-    return visible and focused and (cells_rebuilt or animation_pending);
+    // Coalesce terminal output at vsync even in an unfocused window.
+    // Focus only gates Ghosttal motion in motionDelay, not dirty frames.
+    return visible and (cells_rebuilt or animation_pending);
 }
 
 test "motion scheduling requires a visible focused surface and active motion" {
@@ -36,11 +37,10 @@ test "motion scheduling requires a visible focused surface and active motion" {
 
 test "display link policy covers cell updates and animation transitions" {
     const testing = @import("std").testing;
-    try testing.expect(!displayLinkShouldRun(false, true, true, true));
-    try testing.expect(!displayLinkShouldRun(true, false, true, true));
-    try testing.expect(!displayLinkShouldRun(true, true, false, false));
-    try testing.expect(displayLinkShouldRun(true, true, true, false));
-    try testing.expect(displayLinkShouldRun(true, true, false, true));
+    try testing.expect(!displayLinkShouldRun(false, true, true));
+    try testing.expect(!displayLinkShouldRun(true, false, false));
+    try testing.expect(displayLinkShouldRun(true, true, false));
+    try testing.expect(displayLinkShouldRun(true, false, true));
 }
 
 fn expectDelay(expected: ?u64, state: MotionState, interval_ms: u64) !void {

@@ -498,11 +498,15 @@ pub fn add(
     if (step.rootModuleTarget().os.tag.isDarwin()) {
         try @import("apple_sdk").addPaths(b, step);
 
-        const metallib = self.metallib.?;
-        metallib.output.addStepDependencies(&step.step);
-        step.root_module.addAnonymousImport("ghostty_metallib", .{
-            .root_source_file = metallib.output,
-        });
+        // OpenGL builds and tests do not use the Metal shader library.
+        // Avoid requiring Xcode's Metal compiler for those configurations.
+        if (self.config.renderer == .metal) {
+            const metallib = self.metallib.?;
+            metallib.output.addStepDependencies(&step.step);
+            step.root_module.addAnonymousImport("ghostty_metallib", .{
+                .root_source_file = metallib.output,
+            });
+        }
     }
 
     // Other dependencies, mostly pure Zig

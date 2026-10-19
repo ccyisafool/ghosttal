@@ -458,7 +458,8 @@ const Preview = struct {
                             self.mode = .help;
                         if (key.matches('/', .{}))
                             self.mode = .search;
-                        if (key.matchesAny(&.{ vaxis.Key.enter, vaxis.Key.kp_enter }, .{}))
+                        if (key.matchesAny(&.{ vaxis.Key.enter, vaxis.Key.kp_enter }, .{}) and
+                            self.filtered.items.len > 0)
                             self.mode = .save;
                         if (key.matchesAny(&.{ 'x', '/' }, .{ .ctrl = true })) {
                             self.text_input.buf.clearRetainingCapacity();
@@ -467,7 +468,7 @@ const Preview = struct {
                         if (key.matchesAny(&.{ vaxis.Key.home, vaxis.Key.kp_home, 'g' }, .{}))
                             self.current = 0;
                         if (key.matchesAny(&.{ vaxis.Key.end, vaxis.Key.kp_end, 'G' }, .{}))
-                            self.current = self.filtered.items.len - 1;
+                            self.current = self.filtered.items.len -| 1;
                         if (key.matchesAny(&.{ 'j', '+', vaxis.Key.down, vaxis.Key.kp_down, vaxis.Key.kp_add }, .{}))
                             self.down(1);
                         if (key.matchesAny(&.{ vaxis.Key.page_down, vaxis.Key.kp_down }, .{}))
@@ -480,18 +481,20 @@ const Preview = struct {
                             self.hex = true;
                         if (key.matches('d', .{}))
                             self.hex = false;
-                        if (key.matches('c', .{}))
-                            try self.vx.copyToSystemClipboard(
-                                self.tty.writer(),
-                                self.themes[self.filtered.items[self.current]].theme,
-                                alloc,
-                            )
-                        else if (key.matches('c', .{ .shift = true }))
-                            try self.vx.copyToSystemClipboard(
-                                self.tty.writer(),
-                                self.themes[self.filtered.items[self.current]].path,
-                                alloc,
-                            );
+                        if (self.filtered.items.len > 0) {
+                            if (key.matches('c', .{}))
+                                try self.vx.copyToSystemClipboard(
+                                    self.tty.writer(),
+                                    self.themes[self.filtered.items[self.current]].theme,
+                                    alloc,
+                                )
+                            else if (key.matches('c', .{ .shift = true }))
+                                try self.vx.copyToSystemClipboard(
+                                    self.tty.writer(),
+                                    self.themes[self.filtered.items[self.current]].path,
+                                    alloc,
+                                );
+                        }
                         if (key.matches('f', .{})) {
                             switch (self.theme_filter) {
                                 .all => self.theme_filter = .dark,
@@ -1777,6 +1780,32 @@ const Preview = struct {
         };
     }
 };
+
+test "theme preview keys are safe with no matching themes" {
+    const testing = std.testing;
+    var state: Preview = undefined;
+    state.mode = .normal;
+    state.should_quit = false;
+    state.filtered = .empty;
+    state.current = 0;
+
+    // TTY/clipboard state is deliberately unavailable: these keys must not
+    // try to access it without a selected theme.
+    const keys = [_]vaxis.Key{
+        .{ .codepoint = vaxis.Key.enter },
+        .{ .codepoint = vaxis.Key.kp_enter },
+        .{ .codepoint = vaxis.Key.end },
+        .{ .codepoint = vaxis.Key.kp_end },
+        .{ .codepoint = 'G' },
+        .{ .codepoint = 'c' },
+        .{ .codepoint = 'c', .mods = .{ .shift = true } },
+    };
+    for (keys) |key| {
+        try state.update(.{ .key_press = key }, testing.allocator);
+        try testing.expectEqual(.normal, state.mode);
+        try testing.expectEqual(@as(usize, 0), state.current);
+    }
+}
 
 fn color(config: Config, palette: usize) vaxis.Color {
     return .{

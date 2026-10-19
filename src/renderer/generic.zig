@@ -1434,7 +1434,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // nonsense. Snap instead.
             self.draw_mutex.lockUncancelable(global.io());
             self.cursor_motion.snap = true;
-            self.clearInputMotion();
+            // A held typed quad may be the only rendering of its cell.
+            // Focus doesn't dirty terminal rows, so keep it at rest until
+            // the next ordinary row rebuild restores CellText.
+            self.freezeTypedInputMotion();
             self.draw_mutex.unlock(global.io());
             self.cursor_motion_active.store(false, .release);
 
@@ -1534,7 +1537,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             const should_run = animation_scheduler.displayLinkShouldRun(
                 self.visible,
-                self.focused,
                 self.cells_rebuilt,
                 self.animationWake() != null,
             );
@@ -4790,6 +4792,47 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             try texture.replaceRegion(0, 0, atlas.size, atlas.size, atlas.data);
         }
     };
+}
+
+test "focus changes preserve the withheld typed glyph" {
+    const testing = std.testing;
+    const R = renderer.Renderer;
+    // Only initialize CPU-side state used by setFocus and glyph sampling;
+    // no graphics context or display link is needed for this regression.
+    var r: R = undefined;
+    r.draw_mutex = .init;
+    r.focused = true;
+    r.config.vsync = false;
+    r.display_link = null;
+    r.cells_rebuilt = false;
+    r.cursor_motion = .{ .anim = .init(.ease, 150) };
+    r.cursor_motion_active = .init(false);
+    r.input_motion_active = .init(true);
+    const quad = std.mem.zeroes(R.API.shaders.InputGlyphQuad);
+    r.input_decay_motion = .{ .quad = quad, .start = .zero };
+    r.input_commit_motion = .{ .quads = undefined, .len = 0, .start = .zero };
+    r.input_glyph_motion = .{
+        .quad = quad,
+        .start = .zero,
+        .generation = 1,
+        .row = 0,
+        .col = 0,
+    };
+
+    try r.setFocus(false);
+    try testing.expect(r.input_glyph_motion != null);
+    try testing.expect(r.cells_rebuilt);
+    try testing.expect(!r.inputMotionActive());
+    try testing.expect(r.input_decay_motion == null);
+    try testing.expect(r.input_commit_motion == null);
+    const sampled = r.sampleInputGlyphMotion().?;
+    try testing.expectEqual(quad.pos, sampled.quad.pos);
+    try testing.expectEqual(@as(u8, 255), sampled.quad.opacity);
+    try testing.expect(!sampled.active);
+
+    try r.setFocus(true);
+    try testing.expect(r.input_glyph_motion != null);
+    try testing.expect(!r.sampleInputGlyphMotion().?.active);
 }
 
 test "cursor motion style mapping" {

@@ -71,7 +71,7 @@ The helper never deletes the certificate file supplied by the maintainer.
 
 ## Local release
 
-Install Zig 0.16.0, Nushell 0.115.1, Xcode 26, Sparkle 2.9.0 tools, and
+Install Zig 0.16.0, Nushell 0.115.1, Xcode 26, Sparkle 2.9.6 tools, and
 `create-dmg`. Prepare and check out the clean tagged commit, then run:
 
 ```sh
