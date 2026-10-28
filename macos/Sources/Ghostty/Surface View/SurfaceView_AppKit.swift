@@ -568,6 +568,8 @@ extension Ghostty {
             NSCursor.setHiddenUntilMouseMoves(!visible)
         }
 
+        // MARK: - Title
+
         /// Set the title by prompting the user.
         func promptTitle() {
             // Create an alert dialog
@@ -596,18 +598,7 @@ extension Ghostty {
 
                 // Get the input text
                 let newTitle = textField.stringValue
-                if newTitle.isEmpty {
-                    // Empty means that user wants the title to be set automatically
-                    // We also need to reload the config for the "title" property to be
-                    // used again by this tab.
-                    let prevTitle = titleFromTerminal ?? "👻"
-                    titleFromTerminal = nil
-                    setTitle(prevTitle)
-                } else {
-                    // Set the title and prevent it from being changed automatically
-                    titleFromTerminal = title
-                    title = newTitle
-                }
+                self.titleOverride = newTitle.isEmpty ? nil : newTitle
             }
 
             // We prefer to run our alert in a sheet modal if we have a window.
@@ -618,6 +609,34 @@ extension Ghostty {
                 // visible. The above codepath should be taken most times but I'm just
                 // noting this as something I noticed consistently.
                 completionHandler(alert.runModal())
+            }
+        }
+
+        /// An override title for the surface set by the user or via AppleScript.
+        /// When set, this takes precedence over the title reported by pty.
+        /// This computed property is placed here for code locality.
+        var titleOverride: String? {
+            get {
+                titleFromTerminal != nil ? title : nil
+            }
+
+            set {
+                if let newValue, !newValue.isEmpty {
+                    // Set the title and prevent it from being changed automatically
+                    if titleFromTerminal == nil {
+                        // Only capture titleFromTerminal from pty, skip if it was set before by the user
+                        titleFromTerminal = title
+                    }
+                    title = newValue
+                    return
+                }
+
+                // Otherwise, set the title to be updated automatically
+                // We also need to reload the config for the "title" property to be
+                // used again by this surface, but only restore if an override was actually active.
+                guard let prevTitle = titleFromTerminal else { return }
+                titleFromTerminal = nil
+                setTitle(prevTitle)
             }
         }
 
@@ -1614,6 +1633,9 @@ extension Ghostty {
             item.setImageIfDesired(systemSymbolName: "rectangle.bottomhalf.inset.filled")
             item = menu.addItem(withTitle: "Split Up", action: #selector(splitUp(_:)), keyEquivalent: "")
             item.setImageIfDesired(systemSymbolName: "rectangle.tophalf.inset.filled")
+            menu.addItem(.separator())
+            item = menu.addItem(withTitle: "Close Split", action: #selector(closeSurface(_:)), keyEquivalent: "")
+            item.setImageIfDesired(systemSymbolName: "xmark.rectangle")
 
             menu.addItem(.separator())
             item = menu.addItem(withTitle: "Reset Terminal", action: #selector(resetTerminal(_:)), keyEquivalent: "")
@@ -1739,6 +1761,14 @@ extension Ghostty {
         @IBAction func splitUp(_ sender: Any) {
             guard let surface = self.surface else { return }
             ghostty_surface_split(surface, GHOSTTY_SPLIT_DIRECTION_UP)
+        }
+
+        @IBAction func closeSurface(_ sender: Any?) {
+            guard let surface = self.surface else { return }
+            let action = "close_surface"
+            if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
+                AppDelegate.logger.warning("action failed action=\(action, privacy: .public)")
+            }
         }
 
         @objc func resetTerminal(_ sender: Any) {
@@ -2300,7 +2330,9 @@ extension Ghostty.SurfaceView {
 
         if let content {
             DispatchQueue.main.async {
-                self.surfaceModel?.sendText(content)
+                // Dropped text is untrusted, so it goes through the same
+                // paste protection as a clipboard paste.
+                self.surfaceModel?.pasteText(content)
             }
             return true
         }

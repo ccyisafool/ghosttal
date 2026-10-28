@@ -57,9 +57,7 @@ const terminal = struct {
 const log = std.log.scoped(.config);
 
 /// Used on Unixes for some defaults.
-const c = @cImport({
-    @cInclude("unistd.h");
-});
+const c = @import("posix_c");
 
 pub const compatibility = std.StaticStringMap(
     cli.CompatibilityHandler(Config),
@@ -100,6 +98,12 @@ pub const compatibility = std.StaticStringMap(
     // Ghostty 1.4 renamed `scrollback-limit` to `scrollback-limit-bytes`
     // when `scrollback-limit-lines` was added so the units are explicit.
     .{ "scrollback-limit", cli.compatibilityRenamed(Config, "scrollback-limit-bytes") },
+
+    // Ghostty 1.4 updated "copy-on-select", allow copying to the selection
+    // clipboard (on supported operating systems), the system clipboard, or
+    // both. The semantics also changed but this is the correct mapping.
+    // See: https://github.com/ghostty-org/ghostty/pull/12604
+    .{ "copy-on-select", compatCopyOnSelect },
 });
 
 /// Set Ghostty's graphical user interface language to a language other than the
@@ -264,7 +268,7 @@ language: ?[:0]const u8 = null,
 /// On Linux with GTK, font size is scaled according to both display-wide and
 /// text-specific scaling factors, which are often managed by your desktop
 /// environment (e.g. the GNOME display scale and large text settings).
-@"font-size": f32 = switch (builtin.os.tag) {
+@"font-size": f32 = switch (builtin.target.os.tag) {
     // On macOS we default a little bigger since this tends to look better. This
     // is purely subjective but this is easy to modify.
     .macos => 13,
@@ -402,7 +406,7 @@ language: ?[:0]const u8 = null,
 ///
 /// Available since: 1.1.0
 @"alpha-blending": AlphaBlending =
-    if (builtin.os.tag == .macos)
+    if (builtin.target.os.tag == .macos)
         .native
     else
         .@"linear-corrected",
@@ -2538,7 +2542,7 @@ keybind: Keybinds = .{},
 
 /// Require confirmation before pasting text that appears unsafe. This helps
 /// prevent a "copy/paste attack" where a user may accidentally execute unsafe
-/// commands by pasting text with newlines.
+/// commands by pasting text with newlines or carriage returns.
 @"clipboard-paste-protection": bool = true,
 
 /// If true, bracketed pastes will be considered safe. By default, bracketed
@@ -2567,25 +2571,28 @@ keybind: Keybinds = .{},
 /// limit per surface is double.
 @"image-storage-limit": u32 = 320 * 1000 * 1000,
 
-/// Whether to automatically copy selected text to the clipboard. `true`
-/// will prefer to copy to the selection clipboard, otherwise it will copy to
-/// the system clipboard.
+/// Whether to automatically copy selected text to the clipboard.
 ///
-/// The value `clipboard` will always copy text to the selection clipboard
-/// as well as the system clipboard.
+/// Valid values:
 ///
-/// Middle-click primary paste (see `middle-click-action`) is enabled by
-/// default even if this is `false`. The clipboard it pastes from follows
-/// this setting: with `true` (or `false`) it reads from the selection
-/// clipboard (falling back to the system clipboard on platforms without a
-/// selection clipboard); with `clipboard` it reads from the system
-/// clipboard.
+/// * `none` - Do not copy selected text automatically.
 ///
-/// The default value is true on Linux and macOS.
-@"copy-on-select": CopyOnSelect = switch (builtin.os.tag) {
-    .linux => .true,
-    .macos => .true,
-    else => .false,
+/// * `primary` - On Linux, copy to the selection clipboard only. This has no
+///   effect on macOS. (Available since: 1.4.0)
+///
+/// * `clipboard` - Copy text to the system clipboard only.
+///
+/// * `both` - Copy to both clipboards on Linux, and only the system clipboard
+///   on macOS. (Available since: 1.4.0)
+///
+/// For backward compatibility and convenience, a value of `true` is the same as
+/// `primary` on Linux and `clipboard` on macOS, and `false` is an alias for
+/// `none`.
+///
+/// The default value is `primary` on Linux and `none` otherwise.
+@"copy-on-select": CopyOnSelect = switch (builtin.target.os.tag) {
+    .linux => .primary,
+    else => .none,
 },
 
 /// The action to take when the user right-clicks on the terminal surface.
@@ -2604,8 +2611,9 @@ keybind: Keybinds = .{},
 /// The action to take when the user middle-clicks on the terminal surface.
 ///
 /// Valid values:
-///   * `primary-paste` - Paste from the selection (or system) clipboard per
-///      `copy-on-select`.
+///   * `primary-paste` - Paste from the selection clipboard on Linux.
+///      Does nothing on macOS.
+///   * `clipboard-paste` - Paste from the system clipboard.
 ///   * `ignore` - Do nothing, ignore the middle click.
 ///
 /// The default value is `primary-paste`.
@@ -2679,7 +2687,7 @@ keybind: Keybinds = .{},
 /// On Linux, if this is `true`, Ghostty can delay quitting fully until a
 /// configurable amount of time has passed after the last window is closed.
 /// See the documentation of `quit-after-last-window-closed-delay`.
-@"quit-after-last-window-closed": bool = builtin.os.tag == .linux,
+@"quit-after-last-window-closed": bool = builtin.target.os.tag == .linux,
 
 /// Controls how long Ghostty will stay running after the last open surface has
 /// been closed. This only has an effect if `quit-after-last-window-closed` is
@@ -2900,7 +2908,7 @@ keybind: Keybinds = .{},
 /// accessible than on macOS, meaning that it is more preferable to keep the
 /// quick terminal open until the user has completed their task.
 /// This default may change in the future.
-@"quick-terminal-autohide": bool = switch (builtin.os.tag) {
+@"quick-terminal-autohide": bool = switch (builtin.target.os.tag) {
     .linux => false,
     .macos => true,
     else => false,
@@ -3119,6 +3127,76 @@ keybind: Keybinds = .{},
 /// if you know you need KAM, you know. If you don't know if you
 /// need KAM, you don't need it.
 @"vt-kam-allowed": bool = false,
+
+/// If true, allows the running program to resize the window using the
+/// xterm `CSI 8 ; rows ; columns t` escape sequence. If a parameter is zero
+/// or omitted, the current size of that dimension is kept. Sizes smaller
+/// than 40 columns by 10 rows are raised to that size so that a program
+/// can't shrink the window to hide its output.
+///
+/// The request is ignored if the terminal is in a split, in a window with
+/// multiple tabs, or the quick terminal, or if the window manager controls
+/// the window size, such as when it is fullscreen, maximized, or tiled.
+/// Sizes larger than the screen are clamped to the screen.
+///
+/// This is disabled by default because it lets any program, including one
+/// running on a remote machine, change the size of your window.
+///
+/// Available since: 1.4.0
+@"vt-window-resize-allowed": bool = false,
+
+/// Enables or disables checksum reporting (DECRQCRA, `CSI Pi ; Pg ; Pt ;
+/// Pl ; Pb ; Pr * y`). This escape sequence allows the running program to
+/// ask for a checksum of an area of the screen. Terminal test suites use it
+/// to check what is on the screen.
+///
+/// This is disabled by default because a program can ask for the checksum of
+/// one cell at a time and so read back everything on the screen, including
+/// the output of other programs.
+///
+/// While this is disabled, XTCHECKSUM (`CSI Ps # y`), which changes how the
+/// checksum is calculated, is ignored as well.
+///
+/// Available since: 1.4.0
+@"vt-xt-checksum-report": bool = false,
+
+/// How the checksum reported for DECRQCRA (see `vt-xt-checksum-report`) is
+/// calculated. This is the calculation used after a reset, like xterm's
+/// `checksumExtension` resource. A running program can change it with
+/// XTCHECKSUM (`CSI Ps # y`) until the next reset. The default is the
+/// calculation of a real DEC terminal.
+///
+/// Valid values are:
+///
+///   * `negate` - Report the negated sum, as DEC terminals do.
+///
+///   * `attributes` - Add bold, underline, blink, inverse, invisible, and
+///     protected attributes to the value of each cell.
+///
+///   * `trim` - Omit plain spaces other than the first cell of the area.
+///
+///   * `undrawn` - Count cells that were never written to as spaces
+///     instead of skipping them.
+///
+///   * `full` - Use the full codepoint of each cell instead of the DEC
+///     8-bit value.
+///
+/// Prefix a value with `no-` to disable it. For example, esctest expects
+/// `no-negate,no-attributes,no-trim,full` when run with `--xterm-checksum`,
+/// which is xterm's `checksumExtension: 23`.
+///
+/// The bits of xterm's resource are described in its
+/// [man page](https://github.com/ThomasDickey/xterm-snapshots/blob/xterm-411/xterm.man#L2870-L2896)
+/// and its [control sequence documentation](https://github.com/ThomasDickey/xterm-snapshots/blob/xterm-411/ctlseqs.ms#L2562-L2569),
+/// but where those disagree with xterm's
+/// [implementation](https://github.com/ThomasDickey/xterm-snapshots/blob/xterm-411/screen.c#L3162-L3290),
+/// Ghostty follows the implementation. The documentation describes bit 3
+/// as omitting cells that were never written to, but xterm skips those
+/// cells by default and counts them as spaces with the bit set, which is
+/// `undrawn` here. It also lists a bit 5 that xterm doesn't implement.
+///
+/// Available since: 1.4.0
+@"vt-xt-checksum-extension": XtChecksumExtension = .{},
 
 /// Custom shaders to run after the default shaders. This is a file path
 /// to a GLSL-syntax shader for all platforms.
@@ -3713,7 +3791,7 @@ keybind: Keybinds = .{},
 ///   * `always` - Always use cgroups.
 ///   * `single-instance` - Enable cgroups only for Ghostty instances launched
 ///     as single-instance applications (see gtk-single-instance).
-@"linux-cgroup": LinuxCgroup = if (builtin.os.tag == .linux)
+@"linux-cgroup": LinuxCgroup = if (builtin.target.os.tag == .linux)
     .@"single-instance"
 else
     .never,
@@ -3763,7 +3841,7 @@ else
 /// debug builds, `false` for all others.
 ///
 /// Available since: 1.1.0
-@"gtk-opengl-debug": bool = builtin.mode == .Debug,
+@"gtk-opengl-debug": bool = builtin.mode == .debug,
 
 /// If `true`, the Ghostty GTK application will run in single-instance mode:
 /// each new `ghostty` process launched will result in a new window if there is
@@ -3812,6 +3890,13 @@ else
 /// keybind if your window doesn't have a title bar, or you can switch tabs
 /// with keybinds.
 @"gtk-tabs-location": GtkTabsLocation = .top,
+
+/// If true, the close button of each tab is shown at the start of the tab
+/// (the left, in left-to-right languages) and the tab's icon at the end.
+/// This applies to both the tab bar and the tab overview. GTK only.
+///
+/// Available since: 1.4.0
+@"gtk-tabs-inverted": bool = false,
 
 /// If this is `true`, the titlebar will be hidden when the window is maximized,
 /// and shown when the titlebar is unmaximized. GTK only.
@@ -4253,7 +4338,7 @@ pub fn loadDefaultFiles(self: *Config, alloc: Allocator) !void {
     const ghosttal_xdg = try file_load.ghosttalDefaultXdgPath(alloc);
     defer alloc.free(ghosttal_xdg);
 
-    if (comptime builtin.os.tag == .macos) {
+    if (comptime builtin.target.os.tag == .macos) {
         // Keep these paths alive through loadDefaultFileLayers. Defers inside a
         // separate macOS block would free them before the layers are consumed.
         const ghostty_legacy_app_support = try file_load.ghosttyLegacyDefaultAppSupportPath(alloc);
@@ -4371,12 +4456,12 @@ test "Ghosttal config overlay wins over Ghostty base" {
         try writer.end();
     }
 
-    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var base_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const base = base_buf[0..try td.dir.realPathFile(testing.io, "ghostty-base", &base_buf)];
-    var overlay_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var overlay_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const overlay = overlay_buf[0..try td.dir.realPathFile(testing.io, "ghosttal-overlay", &overlay_buf)];
-    var missing_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const missing = try std.fmt.bufPrint(&missing_buf, "{s}.missing", .{base});
+    var missing_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const missing = try std.mem.print(&missing_buf, "{s}.missing", .{base});
 
     var cfg = try Config.default(alloc);
     defer cfg.deinit();
@@ -4405,7 +4490,7 @@ test "Ghosttal overlay and CLI override nested Ghostty base includes" {
         .{ .name = "cli-include", .contents = "font-size = 40\n" },
         .{ .name = "theme", .contents = "font-size = 5\n" },
     };
-    var path_bufs: [files.len][std.fs.max_path_bytes]u8 = undefined;
+    var path_bufs: [files.len][std.Io.Dir.max_path_bytes]u8 = undefined;
     var paths: [files.len][]const u8 = undefined;
     for (files, 0..) |file_data, i| {
         const file = try td.dir.createFile(testing.io, file_data.name, .{});
@@ -4416,9 +4501,9 @@ test "Ghosttal overlay and CLI override nested Ghostty base includes" {
         try writer.end();
         paths[i] = path_bufs[i][0..try td.dir.realPathFile(testing.io, file_data.name, &path_bufs[i])];
     }
-    const cli_include = try std.fmt.allocPrint(alloc, "--config-file={s}", .{paths[6]});
+    const cli_include = try alloc.print("--config-file={s}", .{paths[6]});
     defer alloc.free(cli_include);
-    const theme_arg = try std.fmt.allocPrint(alloc, "--theme={s}", .{paths[7]});
+    const theme_arg = try alloc.print("--theme={s}", .{paths[7]});
     defer alloc.free(theme_arg);
     const missing = try std.fs.path.join(alloc, &.{ std.fs.path.dirname(paths[0]).?, "missing" });
     defer alloc.free(missing);
@@ -4474,7 +4559,7 @@ test "Ghosttal base include cycles retain diagnostics across loading phases" {
     var writer = file.writer(testing.io, &buf);
     try writer.interface.writeAll("config-file = cycle\nfont-size = 10\n");
     try writer.end();
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = path_buf[0..try td.dir.realPathFile(testing.io, "cycle", &path_buf)];
     const missing = try std.fs.path.join(alloc, &.{ std.fs.path.dirname(path).?, "missing" });
     defer alloc.free(missing);
@@ -4502,10 +4587,10 @@ test "default config layers load in complete precedence order" {
 
     var writer_buf: [256]u8 = undefined;
     var name_bufs: [8][32]u8 = undefined;
-    var path_bufs: [8][std.fs.max_path_bytes]u8 = undefined;
+    var path_bufs: [8][std.Io.Dir.max_path_bytes]u8 = undefined;
     var paths: [8][]const u8 = undefined;
     for (0..paths.len) |i| {
-        const name = try std.fmt.bufPrint(&name_bufs[i], "layer-{d}", .{i + 1});
+        const name = try std.mem.print(&name_bufs[i], "layer-{d}", .{i + 1});
         var file = try td.dir.createFile(testing.io, name, .{});
         defer file.close(testing.io);
         var writer = file.writer(testing.io, &writer_buf);
@@ -4515,8 +4600,8 @@ test "default config layers load in complete precedence order" {
         paths[i] = path_bufs[i][0..path_len];
     }
 
-    var missing_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const missing = try std.fmt.bufPrint(&missing_buf, "{s}.missing", .{paths[0]});
+    var missing_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const missing = try std.mem.print(&missing_buf, "{s}.missing", .{paths[0]});
 
     // Every prefix should leave the final existing file authoritative. This
     // verifies both legacy-before-current ordering and all four base/overlay
@@ -4541,7 +4626,7 @@ test "default config layers load in complete precedence order" {
 
 /// Load and parse the CLI args.
 pub fn loadCliArgs(self: *Config, alloc_gpa: Allocator) !void {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .windows => {},
 
         // Fast-path if we are Linux/BSD and have no args.
@@ -4563,7 +4648,7 @@ pub fn loadCliArgs(self: *Config, alloc_gpa: Allocator) !void {
     //     styling, etc. based on the command.
     //
     // See: https://github.com/Vladimir-csp/xdg-terminal-exec
-    if ((comptime builtin.os.tag == .linux) or (comptime builtin.os.tag == .freebsd)) {
+    if ((comptime builtin.target.os.tag == .linux) or (comptime builtin.target.os.tag == .freebsd)) {
         if (internal_os.xdg.parseTerminalExec(global.args().vector)) |args| {
             const arena_alloc = self._arena.?.allocator();
 
@@ -4578,7 +4663,7 @@ pub fn loadCliArgs(self: *Config, alloc_gpa: Allocator) !void {
             errdefer builder.deinit(arena_alloc);
             for (args) |arg_raw| {
                 const arg = std.mem.sliceTo(arg_raw, 0);
-                const copy = try arena_alloc.dupeZ(u8, arg);
+                const copy = try arena_alloc.dupeSentinel(u8, arg, 0);
                 try self._replay_steps.append(arena_alloc, .{ .arg = copy });
                 try builder.append(arena_alloc, copy);
             }
@@ -4639,7 +4724,7 @@ pub fn loadCliArgs(self: *Config, alloc_gpa: Allocator) !void {
 
     // Any paths referenced from the CLI are relative to the current working
     // directory.
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     try self.expandPaths(buf[0..try std.Io.Dir.cwd().realPathFile(
         global.io(),
         ".",
@@ -4699,8 +4784,7 @@ pub fn loadRecursiveFiles(self: *Config, alloc_gpa: Allocator) !void {
         // We must only load a unique file once
         if (try loaded.fetchPut(path, {}) != null) {
             const diag: cli.Diagnostic = .{
-                .message = try std.fmt.allocPrintSentinel(
-                    arena_alloc,
+                .message = try arena_alloc.printSentinel(
                     "config-file {s}: cycle detected",
                     .{path},
                     0,
@@ -4715,8 +4799,7 @@ pub fn loadRecursiveFiles(self: *Config, alloc_gpa: Allocator) !void {
         var file = std.Io.Dir.openFileAbsolute(global.io(), path, .{}) catch |err| {
             if (err != error.FileNotFound or !optional) {
                 const diag: cli.Diagnostic = .{
-                    .message = try std.fmt.allocPrintSentinel(
-                        arena_alloc,
+                    .message = try arena_alloc.printSentinel(
                         "error opening config-file {s}: {}",
                         .{ path, err },
                         0,
@@ -4735,8 +4818,7 @@ pub fn loadRecursiveFiles(self: *Config, alloc_gpa: Allocator) !void {
             .file => {},
             else => |kind| {
                 const diag: cli.Diagnostic = .{
-                    .message = try std.fmt.allocPrintSentinel(
-                        arena_alloc,
+                    .message = try arena_alloc.printSentinel(
                         "config-file {s}: not reading because file type is {s}",
                         .{ path, @tagName(kind) },
                         0,
@@ -4792,15 +4874,15 @@ pub fn changeConditionalState(
     // If the conditional state between the old and new is the same,
     // then we don't need to do anything.
     relevant: {
-        inline for (@typeInfo(conditional.Key).@"enum".fields) |field| {
-            const key: conditional.Key = @field(conditional.Key, field.name);
+        inline for (@typeInfo(conditional.Key).@"enum".field_names) |field| {
+            const key: conditional.Key = @field(conditional.Key, field);
 
             // Conditional set contains the keys that this config uses. So we
             // only continue if we use this key.
             if (self._conditional_set.contains(key) and !deepEqual(
-                @TypeOf(@field(self._conditional_state, field.name)),
-                @field(self._conditional_state, field.name),
-                @field(new, field.name),
+                @TypeOf(@field(self._conditional_state, field)),
+                @field(self._conditional_state, field),
+                @field(new, field),
             )) {
                 break :relevant;
             }
@@ -4841,17 +4923,17 @@ fn expandPaths(self: *Config, base: []const u8) !void {
     );
 
     // Expand all of our paths
-    inline for (@typeInfo(Config).@"struct".fields) |field| {
-        switch (field.type) {
+    inline for (@typeInfo(Config).@"struct".field_names, @typeInfo(Config).@"struct".field_types) |field, field_type| {
+        switch (field_type) {
             RepeatablePath, Path => {
-                try @field(self, field.name).expand(
+                try @field(self, field).expand(
                     arena_alloc,
                     base,
                     &self._diagnostics,
                 );
             },
             ?RepeatablePath, ?Path => {
-                if (@field(self, field.name)) |*path| {
+                if (@field(self, field)) |*path| {
                     try path.expand(
                         arena_alloc,
                         base,
@@ -5073,14 +5155,14 @@ pub fn finalize(self: *Config) !void {
 
                 log.info("default shell source=env value={s}", .{value});
 
-                const copy = try alloc.dupeZ(u8, value);
+                const copy = try alloc.dupeSentinel(u8, value, 0);
                 self.command = .{ .shell = copy };
 
                 // If we don't need the working directory, then we can exit now.
                 if (wd != .home) break :command;
             }
 
-            switch (builtin.os.tag) {
+            switch (builtin.target.os.tag) {
                 .windows => {
                     if (self.command == null) {
                         log.warn("no default shell found, will default to using cmd", .{});
@@ -5090,7 +5172,7 @@ pub fn finalize(self: *Config) !void {
                     if (wd == .home) {
                         var environ_map = try global.environMap();
                         defer environ_map.deinit();
-                        var buf: [std.fs.max_path_bytes]u8 = undefined;
+                        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
                         if (try internal_os.home(global.io(), &environ_map, &buf)) |home| {
                             wd = .{ .path = try alloc.dupe(u8, home) };
                         } else {
@@ -5214,7 +5296,7 @@ pub fn parseManuallyHook(
         errdefer command.deinit(alloc);
 
         while (iter.next()) |param| {
-            const copy = try alloc.dupeZ(u8, param);
+            const copy = try alloc.dupeSentinel(u8, param, 0);
             try self._replay_steps.append(alloc, .{ .arg = copy });
             try command.append(alloc, copy);
         }
@@ -5222,8 +5304,7 @@ pub fn parseManuallyHook(
         if (command.items.len == 0) {
             try self._diagnostics.append(alloc, .{
                 .location = try cli.Location.fromIter(iter, alloc),
-                .message = try std.fmt.allocPrintSentinel(
-                    alloc,
+                .message = try alloc.printSentinel(
                     "missing command after {s}",
                     .{arg},
                     0,
@@ -5249,7 +5330,7 @@ pub fn parseManuallyHook(
     // Keep track of our input args for replay
     try self._replay_steps.append(
         alloc,
-        .{ .arg = try alloc.dupeZ(u8, arg) },
+        .{ .arg = try alloc.dupeSentinel(u8, arg, 0) },
     );
 
     // If we didn't find a special case, continue parsing normally
@@ -5369,6 +5450,31 @@ fn compatMacOSDockDropBehavior(
     return false;
 }
 
+fn compatCopyOnSelect(
+    self: *Config,
+    alloc: Allocator,
+    key: []const u8,
+    value: ?[]const u8,
+) bool {
+    _ = alloc;
+    assert(std.mem.eql(u8, key, "copy-on-select"));
+
+    if (std.mem.eql(u8, value orelse "", "true")) {
+        self.@"copy-on-select" = switch (builtin.target.os.tag) {
+            .linux, .freebsd => .primary,
+            else => .clipboard,
+        };
+        return true;
+    }
+
+    if (std.mem.eql(u8, value orelse "", "false")) {
+        self.@"copy-on-select" = .none;
+        return true;
+    }
+
+    return false;
+}
+
 /// Add a diagnostic message to the config with the given string.
 /// This is always added with a location of "none".
 pub fn addDiagnosticFmt(
@@ -5378,8 +5484,7 @@ pub fn addDiagnosticFmt(
 ) Allocator.Error!void {
     const alloc = self._arena.?.allocator();
     try self._diagnostics.append(alloc, .{
-        .message = try std.fmt.allocPrintSentinel(
-            alloc,
+        .message = try alloc.printSentinel(
             fmt,
             args,
             0,
@@ -5427,12 +5532,12 @@ pub fn clone(
     const alloc_arena = result._arena.?.allocator();
 
     // Copy our values
-    inline for (@typeInfo(Config).@"struct".fields) |field| {
-        if (!@hasField(Key, field.name)) continue;
-        @field(result, field.name) = try cloneValue(
+    inline for (@typeInfo(Config).@"struct".field_names, @typeInfo(Config).@"struct".field_types) |field, field_type| {
+        if (!@hasField(Key, field)) continue;
+        @field(result, field) = try cloneValue(
             alloc_arena,
-            field.type,
-            @field(self, field.name),
+            field_type,
+            @field(self, field),
         );
     }
 
@@ -5478,7 +5583,7 @@ fn cloneValue(
     // Do known named types first
     switch (T) {
         []const u8 => return try alloc.dupe(u8, src),
-        [:0]const u8 => return try alloc.dupeZ(u8, src),
+        [:0]const u8 => return try alloc.dupeSentinel(u8, src, 0),
 
         else => {},
     }
@@ -5532,19 +5637,19 @@ pub fn changeIterator(old: *const Config, new: *const Config) ChangeIterator {
 pub fn changed(self: *const Config, new: *const Config, comptime key: Key) bool {
     // Get the field at comptime
     const field = comptime field: {
-        const fields = std.meta.fields(Config);
-        for (fields) |field| {
-            if (@field(Key, field.name) == key) {
-                break :field field;
+        const fields = @typeInfo(Config).@"struct".field_names;
+        for (fields) |field_name| {
+            if (@field(Key, field_name) == key) {
+                break :field field_name;
             }
         }
 
         unreachable;
     };
 
-    const old_value = @field(self, field.name);
-    const new_value = @field(new, field.name);
-    return !deepEqual(field.type, old_value, new_value);
+    const old_value = @field(self, field);
+    const new_value = @field(new, field);
+    return !deepEqual(@FieldType(Config, field), old_value, new_value);
 }
 
 /// This yields a key for every changed field between old and new.
@@ -5554,12 +5659,11 @@ pub const ChangeIterator = struct {
     i: usize = 0,
 
     pub fn next(self: *ChangeIterator) ?Key {
-        const fields = comptime std.meta.fields(Key);
+        const fields = comptime @typeInfo(Key).@"enum".field_names;
         while (self.i < fields.len) {
             switch (self.i) {
                 inline 0...(fields.len - 1) => |i| {
-                    const field = fields[i];
-                    const key = @field(Key, field.name);
+                    const key = @field(Key, fields[i]);
                     self.i += 1;
                     if (self.old.changed(self.new, key)) return key;
                 },
@@ -5577,7 +5681,7 @@ pub const ChangeIterator = struct {
 /// We should keep the set of behaviors that depend on this as small
 /// as possible because magic sucks, but each place is well documented.
 fn probableCliEnvironment() bool {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         // Windows has its own problems, just ignore it for now since
         // its not a real supported target and GTK via WSL2 assuming
         // single instance is probably fine.
@@ -5652,7 +5756,7 @@ const Replay = struct {
             return switch (self) {
                 .@"-e" => self,
                 .diagnostic => |v| .{ .diagnostic = try v.clone(alloc) },
-                .arg => |v| .{ .arg = try alloc.dupeZ(u8, v) },
+                .arg => |v| .{ .arg = try alloc.dupeSentinel(u8, v, 0) },
                 .expand => |v| .{ .expand = try alloc.dupe(u8, v) },
                 .conditional_arg => |v| conditional: {
                     var conds = try alloc.alloc(Conditional, v.conditions.len);
@@ -5837,7 +5941,7 @@ pub const WorkingDirectory = union(enum) {
             else => return,
         };
 
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const expanded = expandHome(path, &buf);
 
         if (std.mem.eql(u8, expanded, path)) return;
@@ -5898,7 +6002,7 @@ pub const WorkingDirectory = union(enum) {
             var wd: Self = .{ .path = "~/projects/ghostty" };
             try wd.finalize(alloc);
 
-            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             const expected = internal_os.expandHome(
                 testing.io,
                 &environ_map,
@@ -5962,7 +6066,7 @@ pub const Color = struct {
 
     /// Format the color as a string.
     pub fn formatBuf(self: Color, buf: []u8) Allocator.Error![]const u8 {
-        return std.fmt.bufPrint(
+        return std.mem.print(
             buf,
             "#{x:0>2}{x:0>2}{x:0>2}",
             .{ self.r, self.g, self.b },
@@ -6298,7 +6402,7 @@ pub const Palette = struct {
     value: terminal.color.Palette = terminal.color.default,
 
     /// Keep track of which indexes were manually set by the user.
-    mask: terminal.color.PaletteMask = .initEmpty(),
+    mask: terminal.color.PaletteMask = .empty,
 
     /// ghostty_config_palette_s
     pub const C = extern struct {
@@ -6347,7 +6451,7 @@ pub const Palette = struct {
         for (0.., self.value) |k, v| {
             try formatter.formatEntry(
                 []const u8,
-                std.fmt.bufPrint(
+                std.mem.print(
                     &buf,
                     "{d}=#{x:0>2}{x:0>2}{x:0>2}",
                     .{ k, v.r, v.g, v.b },
@@ -6472,7 +6576,7 @@ pub const RepeatableString = struct {
             self.overwrite_next = false;
         }
 
-        const copy = try alloc.dupeZ(u8, value);
+        const copy = try alloc.dupeSentinel(u8, value, 0);
         try self.list.append(alloc, copy);
     }
 
@@ -6488,7 +6592,7 @@ pub const RepeatableString = struct {
             list.deinit(alloc);
         }
         for (self.list.items) |item| {
-            const copy = try alloc.dupeZ(u8, item);
+            const copy = try alloc.dupeSentinel(u8, item, 0);
             list.appendAssumeCapacity(copy);
         }
 
@@ -6722,6 +6826,21 @@ pub const SelectionWordChars = struct {
         try testing.expectEqual(@as(u21, '│'), chars.codepoints[1]);
         try testing.expectEqual(@as(u21, ';'), chars.codepoints[2]);
     }
+
+    test "parseCLI truncated UTF-8" {
+        const testing = std.testing;
+        for ([_][]const u8{
+            "\xc2",
+            "\xe2",
+            "\xe2\x94",
+            "\xf0",
+            "\xf0\x9f",
+            "\xf0\x9f\x98",
+        }) |input| {
+            var chars: Self = .{};
+            try testing.expectError(error.InvalidValue, chars.parseCLI(testing.allocator, input));
+        }
+    }
 };
 
 /// FontVariation is a repeatable configuration value that sets a single
@@ -6784,7 +6903,7 @@ pub const RepeatableFontVariation = struct {
 
         var buf: [128]u8 = undefined;
         for (self.list.items) |value| {
-            const str = std.fmt.bufPrint(&buf, "{s}={d}", .{
+            const str = std.mem.print(&buf, "{s}={d}", .{
                 value.id.str(),
                 value.value,
             }) catch return error.OutOfMemory;
@@ -7871,10 +7990,10 @@ pub const Keybinds = struct {
             if (docs) {
                 try formatter.writer.writeAll("\n");
                 const name = @tagName(v);
-                inline for (@typeInfo(help_strings.KeybindAction).@"struct".decls) |decl| {
-                    if (std.mem.eql(u8, decl.name, name)) {
-                        const help = @field(help_strings.KeybindAction, decl.name);
-                        try formatter.writer.writeAll("# " ++ decl.name ++ "\n");
+                inline for (@typeInfo(help_strings.KeybindAction).@"struct".decl_names) |decl| {
+                    if (std.mem.eql(u8, decl, name)) {
+                        const help = @field(help_strings.KeybindAction, decl);
+                        try formatter.writer.writeAll("# " ++ decl ++ "\n");
                         var lines = std.mem.splitScalar(u8, help, '\n');
                         while (lines.next()) |line| {
                             try formatter.writer.writeAll("#   ");
@@ -8438,7 +8557,7 @@ pub const RepeatableCodepointMap = struct {
         const whitespace = " \t";
         const key = std.mem.trim(u8, input[0..eql_idx], whitespace);
         const value = std.mem.trim(u8, input[eql_idx + 1 ..], whitespace);
-        const valueZ = try alloc.dupeZ(u8, value);
+        const valueZ = try alloc.dupeSentinel(u8, value, 0);
 
         var p: UnicodeRangeParser = .{ .input = key };
         while (try p.next()) |range| {
@@ -8486,7 +8605,7 @@ pub const RepeatableCodepointMap = struct {
             if (range[0] == range[1]) {
                 try formatter.formatEntry(
                     []const u8,
-                    std.fmt.bufPrint(
+                    std.mem.print(
                         &buf,
                         "U+{X:0>4}={s}",
                         .{
@@ -8498,7 +8617,7 @@ pub const RepeatableCodepointMap = struct {
             } else {
                 try formatter.formatEntry(
                     []const u8,
-                    std.fmt.bufPrint(
+                    std.mem.print(
                         &buf,
                         "U+{X:0>4}-U+{X:0>4}={s}",
                         .{
@@ -8775,14 +8894,14 @@ pub const RepeatableClipboardCodepointMap = struct {
         const replacements = self.map.list.items(.replacement);
         for (ranges, replacements) |range, replacement| {
             const value_str = switch (replacement) {
-                .codepoint => |cp| try std.fmt.bufPrint(&value_buf, "U+{X:0>4}", .{cp}),
+                .codepoint => |cp| try std.mem.print(&value_buf, "U+{X:0>4}", .{cp}),
                 .string => |s| s,
             };
 
             if (range[0] == range[1]) {
                 try formatter.formatEntry(
                     []const u8,
-                    std.fmt.bufPrint(
+                    std.mem.print(
                         &buf,
                         "U+{X:0>4}={s}",
                         .{ range[0], value_str },
@@ -8791,7 +8910,7 @@ pub const RepeatableClipboardCodepointMap = struct {
             } else {
                 try formatter.formatEntry(
                     []const u8,
-                    std.fmt.bufPrint(
+                    std.mem.print(
                         &buf,
                         "U+{X:0>4}-U+{X:0>4}={s}",
                         .{ range[0], range[1], value_str },
@@ -8909,7 +9028,7 @@ pub const FontStyle = union(enum) {
             return;
         }
 
-        const nameZ = try alloc.dupeZ(u8, value);
+        const nameZ = try alloc.dupeSentinel(u8, value, 0);
         self.* = .{ .name = nameZ };
     }
 
@@ -8926,7 +9045,7 @@ pub const FontStyle = union(enum) {
     pub fn clone(self: Self, alloc: Allocator) Allocator.Error!Self {
         return switch (self) {
             .default, .false => self,
-            .name => |v| .{ .name = try alloc.dupeZ(u8, v) },
+            .name => |v| .{ .name = try alloc.dupeSentinel(u8, v, 0) },
         };
     }
 
@@ -9072,16 +9191,20 @@ pub const RepeatableLink = struct {
 
 /// Options for copy on select behavior.
 pub const CopyOnSelect = enum {
-    /// Disables copy on select entirely.
-    false,
+    /// Disables copy on select entirely. This is the default on macOS.
+    none,
 
     /// Copy on select is enabled, but goes to the selection clipboard.
-    /// This is not supported on platforms such as macOS. This is the default.
-    true,
+    /// This is not supported on platforms such as macOS. This is the default
+    /// on Linux.
+    primary,
+
+    /// Copy on select is enabled and goes to the system clipboard.
+    clipboard,
 
     /// Copy on select is enabled and goes to both the system clipboard
     /// and the selection clipboard (for Linux).
-    clipboard,
+    both,
 };
 
 /// Options for right-click actions.
@@ -9105,8 +9228,10 @@ pub const RightClickAction = enum {
 
 /// Options for middle-click actions.
 pub const MiddleClickAction = enum {
-    /// Paste from the selection/standard clipboard per `copy-on-select`.
+    /// Paste from the selection clipboard.
     @"primary-paste",
+    /// Paste from the standard clipboard.
+    @"clipboard-paste",
 
     /// No action is taken on middle click.
     ignore,
@@ -9131,6 +9256,15 @@ pub const ShellIntegrationFeatures = packed struct {
     @"ssh-env": bool = false,
     @"ssh-terminfo": bool = false,
     path: bool = true,
+};
+
+/// See vt-xt-checksum-extension
+pub const XtChecksumExtension = packed struct {
+    negate: bool = true,
+    attributes: bool = true,
+    trim: bool = true,
+    undrawn: bool = false,
+    full: bool = false,
 };
 
 pub const SplitPreserveZoom = packed struct {
@@ -9221,9 +9355,19 @@ pub const RepeatableCommand = struct {
             item.* = try item.clone(alloc);
         }
 
+        // Cloning value_c directly would copy Command.C structs
+        // whose string pointers still reference the source config's
+        // memory — the clone must stay valid after the source is
+        // freed.
+        var value_c: std.ArrayListUnmanaged(inputpkg.Command.C) = .empty;
+        try value_c.ensureTotalCapacityPrecise(alloc, value.items.len);
+        for (value.items) |item| {
+            value_c.appendAssumeCapacity(try item.cval(alloc));
+        }
+
         return .{
             .value = value,
-            .value_c = try self.value_c.clone(alloc),
+            .value_c = value_c,
         };
     }
 
@@ -9310,6 +9454,26 @@ pub const RepeatableCommand = struct {
 
         try list.parseCLI(alloc, "");
         try testing.expectEqual(inputpkg.command.defaults.len, list.value.items.len);
+    }
+
+    test "RepeatableCommand clone rebuilds the C mirror" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var list: RepeatableCommand = .{};
+        try list.parseCLI(alloc, "title:Foo,description:bar,action:new_tab");
+
+        const copy = try list.clone(alloc);
+        try testing.expectEqual(list.value_c.items.len, copy.value_c.items.len);
+        // The clone's C strings must not alias the source's — the
+        // source config can be freed while the clone lives on.
+        try testing.expect(list.value_c.items[0].title != copy.value_c.items[0].title);
+        try testing.expectEqualStrings(
+            std.mem.span(list.value_c.items[0].title),
+            std.mem.span(copy.value_c.items[0].title),
+        );
     }
 
     test "RepeatableCommand formatConfig empty" {
@@ -10167,8 +10331,8 @@ pub const BackgroundBlur = union(enum) {
         )) |v| switch (v) {
             inline else => |tag| tag: {
                 // We can only parse void types
-                const info = std.meta.fieldInfo(BackgroundBlur, tag);
-                if (info.type != void) break :tag;
+                const info_ty = @typeInfo(BackgroundBlur).@"union".field_types[@backingInt(tag)];
+                if (info_ty != void) break :tag;
                 self.* = @unionInit(
                     BackgroundBlur,
                     @tagName(tag),
@@ -10334,7 +10498,7 @@ pub const Theme = struct {
         //
         // On Windows, a colon at index 1 is a drive letter (e.g. C:\...)
         // and should not trigger light/dark pair parsing.
-        const has_colon = if (comptime builtin.os.tag == .windows)
+        const has_colon = if (comptime builtin.target.os.tag == .windows)
             if (std.mem.indexOf(u8, input, ":")) |idx| idx != 1 else false
         else
             std.mem.indexOf(u8, input, ":") != null;
@@ -10356,29 +10520,29 @@ pub const Theme = struct {
 
         // Set the value to the specified value directly.
         self.* = .{
-            .light = try alloc.dupeZ(u8, trimmed),
+            .light = try alloc.dupeSentinel(u8, trimmed, 0),
             .dark = self.light,
         };
     }
 
     /// Expand tilde paths in light/dark theme values.
     pub fn finalize(self: *Theme, alloc: Allocator) Allocator.Error!void {
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
 
         const light = expandHome(self.light, &buf);
         if (!std.mem.eql(u8, light, self.light))
-            self.light = try alloc.dupeZ(u8, light);
+            self.light = try alloc.dupeSentinel(u8, light, 0);
 
         const dark = expandHome(self.dark, &buf);
         if (!std.mem.eql(u8, dark, self.dark))
-            self.dark = try alloc.dupeZ(u8, dark);
+            self.dark = try alloc.dupeSentinel(u8, dark, 0);
     }
 
     /// Deep copy of the struct. Required by Config.
     pub fn clone(self: *const Theme, alloc: Allocator) Allocator.Error!Theme {
         return .{
-            .light = try alloc.dupeZ(u8, self.light),
-            .dark = try alloc.dupeZ(u8, self.dark),
+            .light = try alloc.dupeSentinel(u8, self.light, 0),
+            .dark = try alloc.dupeSentinel(u8, self.dark, 0),
         };
     }
 
@@ -10393,7 +10557,7 @@ pub const Theme = struct {
             return;
         }
 
-        const str = std.fmt.bufPrint(&buf, "light:{s},dark:{s}", .{
+        const str = std.mem.print(&buf, "light:{s},dark:{s}", .{
             self.light,
             self.dark,
         }) catch return error.OutOfMemory;
@@ -10435,7 +10599,7 @@ pub const Theme = struct {
             var environ_map = try testing.environ.createMap(alloc);
             defer environ_map.deinit();
 
-            var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+            var home_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             const home = try internal_os.expandHome(
                 testing.io,
                 &environ_map,
@@ -10447,13 +10611,13 @@ pub const Theme = struct {
             try v.parseCLI(alloc, "light:~/foo, dark:~/bar");
             try v.finalize(alloc);
 
-            var expected_buf: [std.fs.max_path_bytes]u8 = undefined;
+            var expected_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             try testing.expectEqualStrings(
-                try std.fmt.bufPrint(&expected_buf, "{s}foo", .{home}),
+                try std.mem.print(&expected_buf, "{s}foo", .{home}),
                 v.light,
             );
             try testing.expectEqualStrings(
-                try std.fmt.bufPrint(&expected_buf, "{s}bar", .{home}),
+                try std.mem.print(&expected_buf, "{s}bar", .{home}),
                 v.dark,
             );
         }
@@ -10659,7 +10823,7 @@ pub const WindowPadding = struct {
         if (self.top_left == self.bottom_right) {
             try formatter.formatEntry(
                 []const u8,
-                std.fmt.bufPrint(
+                std.mem.print(
                     &buf,
                     "{}",
                     .{self.top_left},
@@ -10668,7 +10832,7 @@ pub const WindowPadding = struct {
         } else {
             try formatter.formatEntry(
                 []const u8,
-                std.fmt.bufPrint(
+                std.mem.print(
                     &buf,
                     "{},{}",
                     .{ self.top_left, self.bottom_right },
@@ -10741,14 +10905,14 @@ pub const NotifyOnCommandFinishAction = packed struct {
 test "parse duration" {
     inline for (Duration.units) |unit| {
         var buf: [16]u8 = undefined;
-        const t = try std.fmt.bufPrint(&buf, "0{s}", .{unit.name});
+        const t = try std.mem.print(&buf, "0{s}", .{unit.name});
         const d = try Duration.parseCLI(t);
         try std.testing.expectEqual(@as(u64, 0), d.duration);
     }
 
     inline for (Duration.units) |unit| {
         var buf: [16]u8 = undefined;
-        const t = try std.fmt.bufPrint(&buf, "1{s}", .{unit.name});
+        const t = try std.mem.print(&buf, "1{s}", .{unit.name});
         const d = try Duration.parseCLI(t);
         try std.testing.expectEqual(unit.factor, d.duration);
     }
@@ -10822,10 +10986,10 @@ test "test format" {
     inline for (Duration.units) |unit| {
         const d: Duration = .{ .duration = unit.factor };
         var actual_buf: [16]u8 = undefined;
-        const actual = try std.fmt.bufPrint(&actual_buf, "{f}", .{d});
+        const actual = try std.mem.print(&actual_buf, "{f}", .{d});
         var expected_buf: [16]u8 = undefined;
         const expected = if (!std.mem.eql(u8, unit.name, "us"))
-            try std.fmt.bufPrint(&expected_buf, "1{s}", .{unit.name})
+            try std.mem.print(&expected_buf, "1{s}", .{unit.name})
         else
             "1µs";
         try std.testing.expectEqualSlices(u8, expected, actual);
@@ -10963,16 +11127,15 @@ test "clone can then change conditional state" {
         try writer.interface.writeAll(@embedFile("testdata/theme_dark"));
         try writer.end();
     }
-    var light_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var light_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const light = light_buf[0..try td.dir.realPathFile(testing.io, "theme_light", &light_buf)];
-    var dark_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dark_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dark = dark_buf[0..try td.dir.realPathFile(testing.io, "theme_dark", &dark_buf)];
 
     var cfg_light = try Config.default(alloc);
     defer cfg_light.deinit();
     var it: TestIterator = .{ .data = &.{
-        try std.fmt.allocPrint(
-            alloc_arena,
+        try alloc_arena.print(
             "--theme=light:{s},dark:{s}",
             .{ light, dark },
         ),
@@ -11040,7 +11203,7 @@ test "working-directory expands tilde" {
     try cfg.loadIter(alloc, &it);
     try cfg.finalize();
 
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const expected = internal_os.expandHome(
         io,
         &environ_map,
@@ -11120,13 +11283,13 @@ test "theme loading" {
         try writer.interface.writeAll(@embedFile("testdata/theme_simple"));
         try writer.end();
     }
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = path_buf[0..try td.dir.realPathFile(testing.io, "theme", &path_buf)];
 
     var cfg = try Config.default(alloc);
     defer cfg.deinit();
     var it: TestIterator = .{ .data = &.{
-        try std.fmt.allocPrint(alloc_arena, "--theme={s}", .{path}),
+        try alloc_arena.print("--theme={s}", .{path}),
     } };
     try cfg.loadIter(alloc, &it);
     try cfg.finalize();
@@ -11159,14 +11322,14 @@ test "theme loading preserves conditional state" {
         try writer.interface.writeAll(@embedFile("testdata/theme_simple"));
         try writer.end();
     }
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = path_buf[0..try td.dir.realPathFile(testing.io, "theme", &path_buf)];
 
     var cfg = try Config.default(alloc);
     defer cfg.deinit();
     cfg._conditional_state = .{ .theme = .dark };
     var it: TestIterator = .{ .data = &.{
-        try std.fmt.allocPrint(alloc_arena, "--theme={s}", .{path}),
+        try alloc_arena.print("--theme={s}", .{path}),
     } };
     try cfg.loadIter(alloc, &it);
     try cfg.finalize();
@@ -11192,14 +11355,14 @@ test "theme priority is lower than config" {
         try writer.interface.writeAll(@embedFile("testdata/theme_simple"));
         try writer.end();
     }
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = path_buf[0..try td.dir.realPathFile(testing.io, "theme", &path_buf)];
 
     var cfg = try Config.default(alloc);
     defer cfg.deinit();
     var it: TestIterator = .{ .data = &.{
         "--background=#ABCDEF",
-        try std.fmt.allocPrint(alloc_arena, "--theme={s}", .{path}),
+        try alloc_arena.print("--theme={s}", .{path}),
     } };
     try cfg.loadIter(alloc, &it);
     try cfg.finalize();
@@ -11236,9 +11399,9 @@ test "theme loading correct light/dark" {
         try writer.interface.writeAll(@embedFile("testdata/theme_dark"));
         try writer.end();
     }
-    var light_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var light_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const light = light_buf[0..try td.dir.realPathFile(testing.io, "theme_light", &light_buf)];
-    var dark_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dark_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dark = dark_buf[0..try td.dir.realPathFile(testing.io, "theme_dark", &dark_buf)];
 
     // Light
@@ -11246,8 +11409,7 @@ test "theme loading correct light/dark" {
         var cfg = try Config.default(alloc);
         defer cfg.deinit();
         var it: TestIterator = .{ .data = &.{
-            try std.fmt.allocPrint(
-                alloc_arena,
+            try alloc_arena.print(
                 "--theme=light:{s},dark:{s}",
                 .{ light, dark },
             ),
@@ -11268,8 +11430,7 @@ test "theme loading correct light/dark" {
         defer cfg.deinit();
         cfg._conditional_state = .{ .theme = .dark };
         var it: TestIterator = .{ .data = &.{
-            try std.fmt.allocPrint(
-                alloc_arena,
+            try alloc_arena.print(
                 "--theme=light:{s},dark:{s}",
                 .{ light, dark },
             ),
@@ -11289,8 +11450,7 @@ test "theme loading correct light/dark" {
         var cfg = try Config.default(alloc);
         defer cfg.deinit();
         var it: TestIterator = .{ .data = &.{
-            try std.fmt.allocPrint(
-                alloc_arena,
+            try alloc_arena.print(
                 "--theme=light:{s},dark:{s}",
                 .{ light, dark },
             ),

@@ -147,7 +147,7 @@ pub fn preferredAppSupportPath(alloc: Allocator) ![]const u8 {
 ///
 /// The returned value must be freed by the caller.
 pub fn preferredDefaultFilePath(alloc: Allocator) ![]const u8 {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .macos => {
             // Ghosttal's App Support overlay is preferred for editing.
             const app_support_path = try preferredAppSupportPath(alloc);

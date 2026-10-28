@@ -12,12 +12,12 @@ const global = @import("../global.zig");
 pub const Options = struct {
     /// The config option to explain. For example:
     ///
-    ///   ghostty +explain-config --option=font-size
+    ///   ghosttal +explain-config --option=font-size
     option: ?[]const u8 = null,
 
     /// The keybind action to explain. For example:
     ///
-    ///   ghostty +explain-config --keybind=copy_to_clipboard
+    ///   ghosttal +explain-config --keybind=copy_to_clipboard
     keybind: ?[]const u8 = null,
 
     pub fn deinit(self: Options) void {
@@ -36,10 +36,10 @@ pub const Options = struct {
 ///
 /// Examples:
 ///
-///   ghostty +explain-config font-size
-///   ghostty +explain-config copy_to_clipboard
-///   ghostty +explain-config --option=font-size
-///   ghostty +explain-config --keybind=copy_to_clipboard
+///   ghosttal +explain-config font-size
+///   ghosttal +explain-config copy_to_clipboard
+///   ghosttal +explain-config --option=font-size
+///   ghosttal +explain-config --keybind=copy_to_clipboard
 ///
 /// Flags:
 ///

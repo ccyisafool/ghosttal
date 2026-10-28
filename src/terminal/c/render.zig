@@ -15,12 +15,27 @@ const Result = @import("result.zig").Result;
 const cell_c = @import("cell.zig");
 const row = @import("row.zig");
 const style_c = @import("style.zig");
+const PageList = @import("../PageList.zig");
 
 const log = std.log.scoped(.render_state_c);
 
 const RenderStateWrapper = struct {
     alloc: std.mem.Allocator,
     state: renderpkg.RenderState = .empty,
+
+    /// The overscan request set through the C API. This is copied into
+    /// `state.overscan_request` at the start of each update rather than
+    /// written there directly, because the render state reads its
+    /// request to locate the rows of the last update. Changing it
+    /// between an update and reading that update's rows would point the
+    /// reads at the wrong entries.
+    overscan_request: renderpkg.RenderState.Overscan = .{},
+
+    /// Apply any pending option changes to the render state. Called at
+    /// the start of every update.
+    fn applyOptions(self: *RenderStateWrapper) void {
+        self.state.overscan_request = self.overscan_request;
+    }
 };
 
 /// The "before the first element" position for the iterator wrappers
@@ -31,16 +46,29 @@ const position_none = std.math.maxInt(usize);
 const RowIteratorWrapper = struct {
     alloc: std.mem.Allocator,
 
-    /// The current index (also y value) into the row list, or
-    /// `position_none` if iteration hasn't started. Always validate
-    /// against `raws.len` before use.
+    /// The current index into the row slices below, or `position_none`
+    /// if iteration hasn't started. Always validate against `raws.len`
+    /// before use. Without overscan this is also the viewport y. With
+    /// overscan, add `viewport_y_base` to get the viewport y.
     y: usize,
 
-    /// These are the raw pointers into the render state data.
+    /// These are the raw pointers into the render state data. They are
+    /// sliced to the rows the last update captured
+    /// (`RenderState.rowDataRange`), so every index below `raws.len` is
+    /// valid and no other bounds checks are needed.
     raws: []const page.Row,
     cells: []const std.MultiArrayList(renderpkg.RenderState.Cell),
     selection: []const ?[2]size.CellCountInt,
     dirty: []bool,
+
+    /// Pins and serials for row identity, sliced like the other fields.
+    pins: []const PageList.Pin,
+    serials: []const u64,
+
+    /// The viewport y of the first row in the slices. This is the
+    /// negated count of overscan rows captured above the viewport, or
+    /// zero without overscan.
+    viewport_y_base: i32,
 
     /// The global dirty state from the render state that populated this
     /// iterator. This has the same borrowed lifetime as the row slices.
@@ -77,6 +105,21 @@ pub const RowIterator = ?*RowIteratorWrapper;
 /// C: GhosttyRenderStateRowCells
 pub const RowCells = ?*RowCellsWrapper;
 
+/// C: GhosttyRenderStateImageIterator
+pub const ImageIterator = ?*ImageIteratorWrapper;
+
+const ImageIteratorWrapper = struct {
+    alloc: std.mem.Allocator,
+
+    /// The iterator over the render state's image placements. It reads
+    /// the render state's memory, so it is only valid until the next
+    /// update.
+    inner: renderpkg.RenderState.ImagePlacementIterator,
+
+    /// The placement returned by the last `next`, if any.
+    current: ?renderpkg.RenderState.ImagePlacement,
+};
+
 /// C: GhosttyRenderStateDirty
 pub const Dirty = renderpkg.RenderState.Dirty;
 
@@ -85,6 +128,37 @@ pub const RowSelection = extern struct {
     size: usize = @sizeOf(RowSelection),
     start_x: u16 = 0,
     end_x: u16 = 0,
+};
+
+/// C: GhosttyRenderStateOverscan
+///
+/// This uses `u16` rather than `size.CellCountInt` so that the C layout
+/// stays fixed even if the Zig type changes.
+pub const Overscan = extern struct {
+    /// Rows above the viewport.
+    above: u16 = 0,
+
+    /// Rows below the viewport.
+    below: u16 = 0,
+
+    fn init(v: renderpkg.RenderState.Overscan) Overscan {
+        return .{ .above = v.above, .below = v.below };
+    }
+};
+
+/// C: GhosttyRenderStateRowId
+///
+/// Opaque to C, where only equality is documented. The encoding is
+/// internal and may change: `bits[0]` is the page serial and `bits[1]`
+/// is the row index within the page plus one. The plus one guarantees
+/// that the all-zero value is never a valid id, which the C docs promise.
+/// The unused high bits of `bits[1]` are free for future use.
+pub const RowId = extern struct {
+    bits: [2]u64 = .{ 0, 0 },
+
+    pub fn init(id: renderpkg.RenderState.Row.Id) RowId {
+        return .{ .bits = .{ id.serial, @as(u64, id.y) + 1 } };
+    }
 };
 
 /// C: GhosttyRenderStateCursorVisualStyle
@@ -139,6 +213,10 @@ pub const Data = enum(c_int) {
     cursor_viewport_wide_tail = 17,
     cursor = 18,
     colors = 19,
+    overscan = 20,
+    overscan_request = 21,
+    image_iterator = 22,
+    image_placements_generation = 23,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: Data) type {
@@ -156,6 +234,9 @@ pub const Data = enum(c_int) {
             .cursor_viewport_x, .cursor_viewport_y => size.CellCountInt,
             .cursor => Cursor,
             .colors => Colors,
+            .overscan, .overscan_request => Overscan,
+            .image_iterator => ImageIterator,
+            .image_placements_generation => u64,
         };
     }
 };
@@ -163,11 +244,13 @@ pub const Data = enum(c_int) {
 /// C: GhosttyRenderStateOption
 pub const SetOption = enum(c_int) {
     dirty = 0,
+    overscan = 1,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: SetOption) type {
         return switch (self) {
             .dirty => Dirty,
+            .overscan => Overscan,
         };
     }
 };
@@ -218,6 +301,7 @@ pub fn update(
     const state = state_ orelse return .invalid_value;
     const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
 
+    state.applyOptions();
     state.state.update(state.alloc, t) catch return .out_of_memory;
     return .success;
 }
@@ -229,6 +313,7 @@ pub fn begin_update(
     const state = state_ orelse return .invalid_value;
     const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
 
+    state.applyOptions();
     state.state.beginUpdate(state.alloc, t) catch return .out_of_memory;
     return .success;
 }
@@ -293,8 +378,8 @@ inline fn getDispatch(
     out: ?*anyopaque,
 ) Result {
     if (comptime std.debug.runtime_safety) {
-        _ = std.enums.fromInt(Data, @intFromEnum(data)) orelse {
-            log.warn("render_state_get invalid data value={d}", .{@intFromEnum(data)});
+        _ = std.enums.fromInt(Data, @backingInt(data)) orelse {
+            log.warn("render_state_get invalid data value={d}", .{@backingInt(data)});
             return .invalid_value;
         };
     }
@@ -322,16 +407,23 @@ fn getTyped(
         .dirty => out.* = state.state.dirty,
         .row_iterator => {
             const it = out.* orelse return .invalid_value;
+
+            // Only the captured rows hold data from the last update, so
+            // slice to them. Without overscan this is the whole list.
+            const range = state.state.rowDataRange();
             const row_data = state.state.row_data.slice();
             it.* = .{
                 .alloc = it.alloc,
                 .y = position_none,
-                .raws = row_data.items(.raw),
-                .cells = row_data.items(.cells),
-                .selection = row_data.items(.selection),
-                .dirty = row_data.items(.dirty),
+                .raws = row_data.items(.raw)[range.start..range.end],
+                .cells = row_data.items(.cells)[range.start..range.end],
+                .selection = row_data.items(.selection)[range.start..range.end],
+                .dirty = row_data.items(.dirty)[range.start..range.end],
+                .pins = row_data.items(.pin)[range.start..range.end],
+                .serials = row_data.items(.serial)[range.start..range.end],
                 .state_dirty = &state.state.dirty,
                 .palette = &state.state.colors.palette,
+                .viewport_y_base = -@as(i32, state.state.overscan.above),
             };
         },
         .color_background => out.* = state.state.colors.background.cval(),
@@ -361,6 +453,17 @@ fn getTyped(
         },
         .cursor => return writeCursor(state, out),
         .colors => return writeColors(state, out),
+        .overscan => out.* = .init(state.state.overscan),
+        .overscan_request => out.* = .init(state.overscan_request),
+        .image_iterator => {
+            const it = out.* orelse return .invalid_value;
+            it.* = .{
+                .alloc = it.alloc,
+                .inner = state.state.imagePlacementIterator(),
+                .current = null,
+            };
+        },
+        .image_placements_generation => out.* = state.state.imagePlacementsGeneration(),
     }
 
     return .success;
@@ -372,8 +475,8 @@ pub fn set(
     value: ?*const anyopaque,
 ) callconv(lib.calling_conv) Result {
     if (comptime std.debug.runtime_safety) {
-        _ = std.enums.fromInt(SetOption, @intFromEnum(option)) orelse {
-            log.warn("render_state_set invalid option value={d}", .{@intFromEnum(option)});
+        _ = std.enums.fromInt(SetOption, @backingInt(option)) orelse {
+            log.warn("render_state_set invalid option value={d}", .{@backingInt(option)});
             return .invalid_value;
         };
     }
@@ -395,6 +498,12 @@ fn setTyped(
     const state = state_ orelse return .invalid_value;
     switch (option) {
         .dirty => state.state.dirty = value.*,
+
+        // Applied by the next update. See the field docs for why.
+        .overscan => state.overscan_request = .{
+            .above = value.above,
+            .below = value.below,
+        },
     }
 
     return .success;
@@ -550,8 +659,11 @@ pub fn row_iterator_new(
         .cells = undefined,
         .selection = undefined,
         .dirty = undefined,
+        .pins = undefined,
+        .serials = undefined,
         .state_dirty = undefined,
         .palette = undefined,
+        .viewport_y_base = undefined,
     };
     result.* = ptr;
     return .success;
@@ -726,8 +838,8 @@ inline fn rowCellsGetDispatch(
     out: ?*anyopaque,
 ) Result {
     if (comptime std.debug.runtime_safety) {
-        _ = std.enums.fromInt(RowCellsData, @intFromEnum(data)) orelse {
-            log.warn("render_state_row_cells_get invalid data value={d}", .{@intFromEnum(data)});
+        _ = std.enums.fromInt(RowCellsData, @backingInt(data)) orelse {
+            log.warn("render_state_row_cells_get invalid data value={d}", .{@backingInt(data)});
             return .invalid_value;
         };
     }
@@ -881,6 +993,8 @@ pub const RowData = enum(c_int) {
     cells = 3,
     selection = 4,
     cells_raw = 5,
+    viewport_y = 6,
+    id = 7,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: RowData) type {
@@ -891,6 +1005,8 @@ pub const RowData = enum(c_int) {
             .cells => RowCells,
             .selection => RowSelection,
             .cells_raw => cell_c.CellsView,
+            .viewport_y => i32,
+            .id => RowId,
         };
     }
 };
@@ -959,8 +1075,8 @@ inline fn rowGetDispatch(
     out: ?*anyopaque,
 ) Result {
     if (comptime std.debug.runtime_safety) {
-        _ = std.enums.fromInt(RowData, @intFromEnum(data)) orelse {
-            log.warn("render_state_row_get invalid data value={d}", .{@intFromEnum(data)});
+        _ = std.enums.fromInt(RowData, @backingInt(data)) orelse {
+            log.warn("render_state_row_get invalid data value={d}", .{@backingInt(data)});
             return .invalid_value;
         };
     }
@@ -1014,6 +1130,8 @@ fn rowGetTyped(
                 .len = raws.len,
             };
         },
+        .viewport_y => out.* = it.viewport_y_base + @as(i32, @intCast(y)),
+        .id => out.* = .init(.{ .serial = it.serials[y], .y = it.pins[y].y }),
     }
 
     return .success;
@@ -1025,8 +1143,8 @@ pub fn row_set(
     value: ?*const anyopaque,
 ) callconv(lib.calling_conv) Result {
     if (comptime std.debug.runtime_safety) {
-        _ = std.enums.fromInt(RowOption, @intFromEnum(option)) orelse {
-            log.warn("render_state_row_set invalid option value={d}", .{@intFromEnum(option)});
+        _ = std.enums.fromInt(RowOption, @backingInt(option)) orelse {
+            log.warn("render_state_row_set invalid option value={d}", .{@backingInt(option)});
             return .invalid_value;
         };
     }
@@ -1050,6 +1168,182 @@ fn rowSetTyped(
     if (y >= it.raws.len) return .invalid_value;
     switch (option) {
         .dirty => it.dirty[y] = value.*,
+    }
+
+    return .success;
+}
+
+/// C: GhosttyImageProtocol
+pub const ImageProtocol = renderpkg.RenderState.ImageProtocol;
+
+/// C: GhosttyRenderStateImageLayer
+pub const ImageLayer = renderpkg.RenderState.ImageLayer;
+
+/// C: GhosttyRenderStateKittyPlacementKind
+pub const KittyPlacementKind = renderpkg.RenderState.KittyPlacement.Kind;
+
+/// C: GhosttyRenderStateImageData
+pub const ImageData = enum(c_int) {
+    invalid = 0,
+    protocol = 1,
+    image_id = 2,
+    image_generation = 3,
+    layer = 4,
+    z = 5,
+    viewport_col = 6,
+    viewport_row = 7,
+    grid_cols = 8,
+    grid_rows = 9,
+    cell_offset_x = 10,
+    cell_offset_y = 11,
+    pixel_width = 12,
+    pixel_height = 13,
+    source_x = 14,
+    source_y = 15,
+    source_width = 16,
+    source_height = 17,
+    kitty_placement_id = 18,
+    kitty_kind = 19,
+
+    /// Output type expected for querying the data of the given kind.
+    pub fn OutType(comptime self: ImageData) type {
+        return switch (self) {
+            .invalid => void,
+            .protocol => ImageProtocol,
+            .layer => ImageLayer,
+            .kitty_kind => KittyPlacementKind,
+            .image_generation => u64,
+            .image_id,
+            .grid_cols,
+            .grid_rows,
+            .cell_offset_x,
+            .cell_offset_y,
+            .pixel_width,
+            .pixel_height,
+            .source_x,
+            .source_y,
+            .source_width,
+            .source_height,
+            .kitty_placement_id,
+            => u32,
+            .viewport_col, .viewport_row, .z => i32,
+        };
+    }
+};
+
+pub fn image_iterator_new(
+    alloc_: ?*const CAllocator,
+    result: *ImageIterator,
+) callconv(lib.calling_conv) Result {
+    const alloc = lib.alloc.default(alloc_);
+    const ptr = alloc.create(ImageIteratorWrapper) catch {
+        result.* = null;
+        return .out_of_memory;
+    };
+    ptr.* = .{
+        .alloc = alloc,
+        .inner = .{ .rows = &.{}, .viewport_y_base = 0, .placed = &.{} },
+        .current = null,
+    };
+    result.* = ptr;
+    return .success;
+}
+
+pub fn image_iterator_free(
+    iterator_: ImageIterator,
+) callconv(lib.calling_conv) void {
+    const iterator = iterator_ orelse return;
+    const alloc = iterator.alloc;
+    alloc.destroy(iterator);
+}
+
+pub fn image_iterator_next(
+    iterator_: ImageIterator,
+) callconv(lib.calling_conv) bool {
+    const it = iterator_ orelse return false;
+    it.current = it.inner.next();
+    return it.current != null;
+}
+
+pub fn image_get(
+    iterator_: ImageIterator,
+    data: ImageData,
+    out: ?*anyopaque,
+) callconv(lib.calling_conv) Result {
+    if (comptime std.debug.runtime_safety) {
+        _ = std.enums.fromInt(ImageData, @backingInt(data)) orelse {
+            log.warn("render_state_image_get invalid data value={d}", .{@backingInt(data)});
+            return .invalid_value;
+        };
+    }
+
+    return switch (data) {
+        .invalid => .invalid_value,
+        inline else => |comptime_data| imageGetTyped(
+            iterator_,
+            comptime_data,
+            @ptrCast(@alignCast(out orelse return .invalid_value)),
+        ),
+    };
+}
+
+pub fn image_get_multi(
+    iterator_: ImageIterator,
+    count: usize,
+    keys: ?[*]const ImageData,
+    values: ?[*]?*anyopaque,
+    out_written: ?*usize,
+) callconv(lib.calling_conv) Result {
+    const k = keys orelse return .invalid_value;
+    const v = values orelse return .invalid_value;
+
+    for (0..count) |i| {
+        const result = image_get(iterator_, k[i], v[i]);
+        if (result != .success) {
+            if (out_written) |w| w.* = i;
+            return result;
+        }
+    }
+    if (out_written) |w| w.* = count;
+    return .success;
+}
+
+fn imageGetTyped(
+    iterator_: ImageIterator,
+    comptime data: ImageData,
+    out: *data.OutType(),
+) Result {
+    const it = iterator_ orelse return .invalid_value;
+    const p = it.current orelse return .invalid_value;
+    switch (data) {
+        .invalid => return .invalid_value,
+        .protocol => out.* = p.protocol,
+        .image_id => out.* = p.image_id,
+        .image_generation => out.* = p.image_generation,
+        .layer => out.* = p.layer,
+        .z => out.* = p.z,
+        .viewport_col => out.* = p.x,
+        .viewport_row => out.* = p.y,
+        .grid_cols => out.* = p.cols,
+        .grid_rows => out.* = p.rows,
+        .cell_offset_x => out.* = p.offset_x,
+        .cell_offset_y => out.* = p.offset_y,
+        .pixel_width => out.* = p.width,
+        .pixel_height => out.* = p.height,
+        .source_x => out.* = p.source_x,
+        .source_y => out.* = p.source_y,
+        .source_width => out.* = p.source_width,
+        .source_height => out.* = p.source_height,
+
+        // Protocol-specific values. Other protocols have no value. The
+        // switches are exhaustive so that adding a protocol makes this
+        // fail to compile until it is handled here.
+        .kitty_placement_id => switch (p.protocol) {
+            .kitty => |kitty| out.* = kitty.placement_id,
+        },
+        .kitty_kind => switch (p.protocol) {
+            .kitty => |kitty| out.* = kitty.kind,
+        },
     }
 
     return .success;
@@ -1793,12 +2087,12 @@ test "render: row cells get graphemes utf8" {
         try testing.expectEqual(Result.out_of_space, row_cells_get(cells, .graphemes_utf8, @ptrCast(&text)));
         try testing.expectEqual(case.expected.len, text.len);
 
-        var small = [_]u8{'x'} ** 32;
+        var small: [32]u8 = @splat('x');
         const small_cap = case.expected.len - 1;
         text = .{ .ptr = small[0..small_cap].ptr, .cap = small_cap };
         try testing.expectEqual(Result.out_of_space, row_cells_get(cells, .graphemes_utf8, @ptrCast(&text)));
         try testing.expectEqual(case.expected.len, text.len);
-        try testing.expectEqualSlices(u8, &([_]u8{'x'} ** 32), &small);
+        try testing.expectEqualSlices(u8, &@as([32]u8, @splat('x')), &small);
 
         var buf: [32]u8 = undefined;
         text = .{ .ptr = &buf, .cap = case.expected.len };
@@ -2567,4 +2861,833 @@ test "render: row_cells_get_multi null returns invalid_value" {
     var raw: row.CRow = undefined;
     var values = [_]?*anyopaque{@ptrCast(&raw)};
     try testing.expectEqual(Result.invalid_value, row_cells_get_multi(null, 1, null, &values, null));
+}
+
+/// Test helper: a terminal of the given size with `lines` numbered lines
+/// written, so everything above the last `rows` lines is scrollback.
+fn testTerminalWithLines(
+    cols: size.CellCountInt,
+    rows: size.CellCountInt,
+    lines: usize,
+) !terminal_c.Terminal {
+    var terminal: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &terminal,
+        cols,
+        rows,
+    ));
+    errdefer terminal_c.free(terminal);
+
+    var buf: [32]u8 = undefined;
+    for (0..lines) |i| {
+        const line = try std.mem.print(
+            &buf,
+            "{s}line {d}",
+            .{ if (i == 0) "" else "\r\n", i },
+        );
+        terminal_c.vt_write(terminal, line.ptr, line.len);
+    }
+
+    return terminal;
+}
+
+test "render: overscan request applies on the next update" {
+    const rows = 10;
+    const terminal = try testTerminalWithLines(10, rows, 50);
+    defer terminal_c.free(terminal);
+    terminal.?.terminal.scrollViewport(.{ .delta = -5 });
+
+    var state: RenderState = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &state,
+    ));
+    defer free(state);
+    const req: Overscan = .{ .above = 3, .below = 2 };
+    try testing.expectEqual(Result.success, set(state, .overscan, @ptrCast(&req)));
+    try testing.expectEqual(Result.success, update(state, terminal));
+
+    // Changing the request after an update must not affect reading the
+    // rows of that update.
+    const none: Overscan = .{};
+    try testing.expectEqual(Result.success, set(state, .overscan, @ptrCast(&none)));
+    var out: Overscan = .{};
+    try testing.expectEqual(Result.success, get(state, .overscan_request, @ptrCast(&out)));
+    try testing.expectEqual(none, out);
+    try testing.expectEqual(Result.success, get(state, .overscan, @ptrCast(&out)));
+    try testing.expectEqual(req, out);
+
+    var list = try testCollectRows(testing.allocator, state);
+    try testing.expectEqual(3 + rows + 2, list.items.len);
+    try testing.expectEqual(@as(i32, -3), list.items[0].viewport_y);
+    list.deinit(testing.allocator);
+
+    // The next update uses the new request.
+    try testing.expectEqual(Result.success, update(state, terminal));
+    list = try testCollectRows(testing.allocator, state);
+    defer list.deinit(testing.allocator);
+    try testing.expectEqual(rows, list.items.len);
+    try testing.expectEqual(@as(i32, 0), list.items[0].viewport_y);
+}
+
+/// Test helper: a row id and its viewport y from one iteration.
+const TestRowEntry = struct { id: RowId, viewport_y: i32 };
+
+/// Test helper: collect the id and viewport y of every captured row.
+fn testCollectRows(
+    alloc: Allocator,
+    state: RenderState,
+) !std.ArrayList(TestRowEntry) {
+    var it: RowIterator = null;
+    try testing.expectEqual(Result.success, row_iterator_new(
+        &lib.alloc.test_allocator,
+        &it,
+    ));
+    defer row_iterator_free(it);
+    try testing.expectEqual(Result.success, get(state, .row_iterator, @ptrCast(&it)));
+
+    var list: std.ArrayList(TestRowEntry) = .empty;
+    errdefer list.deinit(alloc);
+    while (row_iterator_next(it)) {
+        var entry: TestRowEntry = undefined;
+        try testing.expectEqual(Result.success, row_get(it, .id, @ptrCast(&entry.id)));
+        try testing.expectEqual(Result.success, row_get(it, .viewport_y, @ptrCast(&entry.viewport_y)));
+        try list.append(alloc, entry);
+    }
+
+    return list;
+}
+
+test "render: overscan option roundtrip" {
+    var state: RenderState = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &state,
+    ));
+    defer free(state);
+
+    const req: Overscan = .{ .above = 4, .below = 1 };
+    try testing.expectEqual(Result.success, set(state, .overscan, @ptrCast(&req)));
+
+    var out: Overscan = .{ .above = 99, .below = 99 };
+    try testing.expectEqual(Result.success, get(state, .overscan_request, @ptrCast(&out)));
+    try testing.expectEqual(Overscan{ .above = 4, .below = 1 }, out);
+
+    // Nothing is captured before an update.
+    try testing.expectEqual(Result.success, get(state, .overscan, @ptrCast(&out)));
+    try testing.expectEqual(Overscan{}, out);
+}
+
+test "render: overscan clamps to existing rows" {
+    const terminal = try testTerminalWithLines(10, 10, 50);
+    defer terminal_c.free(terminal);
+    const t = terminal.?.terminal;
+
+    var state: RenderState = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &state,
+    ));
+    defer free(state);
+
+    const req: Overscan = .{ .above = 3, .below = 2 };
+    try testing.expectEqual(Result.success, set(state, .overscan, @ptrCast(&req)));
+
+    var out: Overscan = .{};
+
+    // At the bottom there is nothing below the viewport.
+    try testing.expectEqual(Result.success, update(state, terminal));
+    try testing.expectEqual(Result.success, get(state, .overscan, @ptrCast(&out)));
+    try testing.expectEqual(Overscan{ .above = 3, .below = 0 }, out);
+
+    // Scrolled up, both sides are available.
+    t.scrollViewport(.{ .delta = -5 });
+    try testing.expectEqual(Result.success, update(state, terminal));
+    try testing.expectEqual(Result.success, get(state, .overscan, @ptrCast(&out)));
+    try testing.expectEqual(Overscan{ .above = 3, .below = 2 }, out);
+
+    // At the top there is nothing above the viewport.
+    t.scrollViewport(.top);
+    try testing.expectEqual(Result.success, update(state, terminal));
+    try testing.expectEqual(Result.success, get(state, .overscan, @ptrCast(&out)));
+    try testing.expectEqual(Overscan{ .above = 0, .below = 2 }, out);
+
+    // The request is reported unchanged.
+    try testing.expectEqual(Result.success, get(state, .overscan_request, @ptrCast(&out)));
+    try testing.expectEqual(req, out);
+}
+
+test "render: row iterator unchanged without overscan" {
+    const rows = 10;
+    const terminal = try testTerminalWithLines(10, rows, 50);
+    defer terminal_c.free(terminal);
+    terminal.?.terminal.scrollViewport(.{ .delta = -5 });
+
+    var state: RenderState = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &state,
+    ));
+    defer free(state);
+    try testing.expectEqual(Result.success, update(state, terminal));
+
+    var it: RowIterator = null;
+    try testing.expectEqual(Result.success, row_iterator_new(
+        &lib.alloc.test_allocator,
+        &it,
+    ));
+    defer row_iterator_free(it);
+    try testing.expectEqual(Result.success, get(state, .row_iterator, @ptrCast(&it)));
+
+    // The first update is a full redraw so next_dirty visits every row.
+    var count: usize = 0;
+    var y: size.CellCountInt = undefined;
+    while (row_iterator_next_dirty(it, &y)) : (count += 1) {
+        try testing.expectEqual(count, y);
+        var vy: i32 = undefined;
+        try testing.expectEqual(Result.success, row_get(it, .viewport_y, @ptrCast(&vy)));
+        try testing.expectEqual(@as(i32, y), vy);
+    }
+    try testing.expectEqual(rows, count);
+}
+
+test "render: row iterator covers overscan" {
+    const rows = 10;
+    const terminal = try testTerminalWithLines(10, rows, 50);
+    defer terminal_c.free(terminal);
+    terminal.?.terminal.scrollViewport(.{ .delta = -5 });
+
+    // A reference state with no overscan for comparison.
+    var plain: RenderState = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &plain,
+    ));
+    defer free(plain);
+    try testing.expectEqual(Result.success, update(plain, terminal));
+
+    var plain_it: RowIterator = null;
+    try testing.expectEqual(Result.success, row_iterator_new(
+        &lib.alloc.test_allocator,
+        &plain_it,
+    ));
+    defer row_iterator_free(plain_it);
+    try testing.expectEqual(Result.success, get(plain, .row_iterator, @ptrCast(&plain_it)));
+    try testing.expect(row_iterator_next(plain_it));
+    var plain_raw: row.CRow = undefined;
+    var plain_id: RowId = undefined;
+    try testing.expectEqual(Result.success, row_get(plain_it, .raw, @ptrCast(&plain_raw)));
+    try testing.expectEqual(Result.success, row_get(plain_it, .id, @ptrCast(&plain_id)));
+
+    var state: RenderState = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &state,
+    ));
+    defer free(state);
+    const req: Overscan = .{ .above = 3, .below = 2 };
+    try testing.expectEqual(Result.success, set(state, .overscan, @ptrCast(&req)));
+    try testing.expectEqual(Result.success, update(state, terminal));
+
+    var it: RowIterator = null;
+    try testing.expectEqual(Result.success, row_iterator_new(
+        &lib.alloc.test_allocator,
+        &it,
+    ));
+    defer row_iterator_free(it);
+    try testing.expectEqual(Result.success, get(state, .row_iterator, @ptrCast(&it)));
+
+    var count: usize = 0;
+    var found_top = false;
+    while (row_iterator_next(it)) : (count += 1) {
+        var vy: i32 = undefined;
+        try testing.expectEqual(Result.success, row_get(it, .viewport_y, @ptrCast(&vy)));
+        try testing.expectEqual(@as(i32, @intCast(count)) - 3, vy);
+
+        if (vy == 0) {
+            found_top = true;
+            var raw: row.CRow = undefined;
+            var id: RowId = undefined;
+            try testing.expectEqual(Result.success, row_get(it, .raw, @ptrCast(&raw)));
+            try testing.expectEqual(Result.success, row_get(it, .id, @ptrCast(&id)));
+            try testing.expectEqual(plain_raw, raw);
+            try testing.expectEqual(plain_id, id);
+        }
+    }
+    try testing.expectEqual(3 + rows + 2, count);
+    try testing.expect(found_top);
+}
+
+test "render: row iterator overscan at the bottom" {
+    const rows = 10;
+    const terminal = try testTerminalWithLines(10, rows, 50);
+    defer terminal_c.free(terminal);
+
+    var state: RenderState = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &state,
+    ));
+    defer free(state);
+    const req: Overscan = .{ .above = 3, .below = 2 };
+    try testing.expectEqual(Result.success, set(state, .overscan, @ptrCast(&req)));
+    try testing.expectEqual(Result.success, update(state, terminal));
+
+    var list = try testCollectRows(testing.allocator, state);
+    defer list.deinit(testing.allocator);
+    try testing.expectEqual(3 + rows, list.items.len);
+    try testing.expectEqual(@as(i32, -3), list.items[0].viewport_y);
+    try testing.expectEqual(@as(i32, rows - 1), list.items[list.items.len - 1].viewport_y);
+}
+
+test "render: row ids stable across scroll" {
+    const rows = 10;
+    const terminal = try testTerminalWithLines(10, rows, 50);
+    defer terminal_c.free(terminal);
+    const t = terminal.?.terminal;
+    t.scrollViewport(.{ .delta = -5 });
+
+    var state: RenderState = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &state,
+    ));
+    defer free(state);
+    const req: Overscan = .{ .above = 3, .below = 2 };
+    try testing.expectEqual(Result.success, set(state, .overscan, @ptrCast(&req)));
+    try testing.expectEqual(Result.success, update(state, terminal));
+
+    var before = try testCollectRows(testing.allocator, state);
+    defer before.deinit(testing.allocator);
+
+    t.scrollViewport(.{ .delta = -1 });
+    try testing.expectEqual(Result.success, update(state, terminal));
+
+    var after = try testCollectRows(testing.allocator, state);
+    defer after.deinit(testing.allocator);
+    try testing.expectEqual(before.items.len, after.items.len);
+
+    // Every row except the last one (which scrolled out of the captured
+    // rows at the bottom) is still present, one row further down.
+    for (before.items) |old| {
+        if (old.viewport_y == rows + 1) continue;
+        const new_vy: ?i32 = for (after.items) |cur| {
+            if (std.meta.eql(cur.id, old.id)) break cur.viewport_y;
+        } else null;
+        try testing.expectEqual(old.viewport_y + 1, new_vy.?);
+    }
+}
+
+test "render: row id without overscan" {
+    const terminal = try testTerminalWithLines(10, 5, 20);
+    defer terminal_c.free(terminal);
+
+    var state: RenderState = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &state,
+    ));
+    defer free(state);
+
+    try testing.expectEqual(Result.success, update(state, terminal));
+    var first = try testCollectRows(testing.allocator, state);
+    defer first.deinit(testing.allocator);
+
+    try testing.expectEqual(Result.success, update(state, terminal));
+    var second = try testCollectRows(testing.allocator, state);
+    defer second.deinit(testing.allocator);
+
+    try testing.expectEqual(5, first.items.len);
+    try testing.expectEqual(first.items.len, second.items.len);
+    for (first.items, second.items) |a, b| {
+        try testing.expectEqual(a.id, b.id);
+        try testing.expect(!std.meta.eql(a.id, RowId{}));
+    }
+}
+
+test "render: overscan invalid values" {
+    var state: RenderState = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &state,
+    ));
+    defer free(state);
+
+    try testing.expectEqual(Result.invalid_value, get(state, .overscan, null));
+    try testing.expectEqual(Result.invalid_value, set(state, .overscan, null));
+
+    const terminal = try testTerminalWithLines(10, 5, 1);
+    defer terminal_c.free(terminal);
+    try testing.expectEqual(Result.success, update(state, terminal));
+
+    var it: RowIterator = null;
+    try testing.expectEqual(Result.success, row_iterator_new(
+        &lib.alloc.test_allocator,
+        &it,
+    ));
+    defer row_iterator_free(it);
+    try testing.expectEqual(Result.success, get(state, .row_iterator, @ptrCast(&it)));
+
+    // Before the first next, there is no current row.
+    var id: RowId = .{};
+    try testing.expectEqual(Result.invalid_value, row_get(it, .id, @ptrCast(&id)));
+}
+
+test "render: overscan get_multi and row_get_multi" {
+    const terminal = try testTerminalWithLines(10, 5, 20);
+    defer terminal_c.free(terminal);
+    terminal.?.terminal.scrollViewport(.{ .delta = -5 });
+
+    var state: RenderState = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &state,
+    ));
+    defer free(state);
+    const req: Overscan = .{ .above = 1, .below = 1 };
+    try testing.expectEqual(Result.success, set(state, .overscan, @ptrCast(&req)));
+    try testing.expectEqual(Result.success, update(state, terminal));
+
+    var rows: u16 = 0;
+    var overscan: Overscan = .{};
+    var overscan_req: Overscan = .{};
+    var written: usize = 0;
+    const keys = [_]Data{ .rows, .overscan, .overscan_request };
+    var values = [_]?*anyopaque{ @ptrCast(&rows), @ptrCast(&overscan), @ptrCast(&overscan_req) };
+    try testing.expectEqual(Result.success, get_multi(state, keys.len, &keys, &values, &written));
+    try testing.expectEqual(keys.len, written);
+    try testing.expectEqual(5, rows);
+    try testing.expectEqual(Overscan{ .above = 1, .below = 1 }, overscan);
+    try testing.expectEqual(req, overscan_req);
+
+    var it: RowIterator = null;
+    try testing.expectEqual(Result.success, row_iterator_new(
+        &lib.alloc.test_allocator,
+        &it,
+    ));
+    defer row_iterator_free(it);
+    try testing.expectEqual(Result.success, get(state, .row_iterator, @ptrCast(&it)));
+    try testing.expect(row_iterator_next(it));
+
+    var dirty: bool = false;
+    var vy: i32 = 0;
+    var id: RowId = .{};
+    const row_keys = [_]RowData{ .dirty, .viewport_y, .id };
+    var row_values = [_]?*anyopaque{ @ptrCast(&dirty), @ptrCast(&vy), @ptrCast(&id) };
+    try testing.expectEqual(Result.success, row_get_multi(it, row_keys.len, &row_keys, &row_values, &written));
+    try testing.expectEqual(row_keys.len, written);
+    try testing.expectEqual(@as(i32, -1), vy);
+    try testing.expect(!std.meta.eql(id, RowId{}));
+}
+
+test "render: image iterator new/free" {
+    var it: ImageIterator = null;
+    try testing.expectEqual(Result.success, image_iterator_new(
+        &lib.alloc.test_allocator,
+        &it,
+    ));
+    try testing.expect(it != null);
+
+    // A new iterator is empty until it is filled from a render state.
+    try testing.expect(!image_iterator_next(it));
+    var image_id: u32 = 0;
+    try testing.expectEqual(Result.invalid_value, image_get(it, .image_id, @ptrCast(&image_id)));
+    image_iterator_free(it);
+
+    image_iterator_free(null);
+    try testing.expect(!image_iterator_next(null));
+}
+
+test "render: image iterator kitty virtual placement" {
+    if (comptime !@import("terminal_options").kitty_graphics) return error.SkipZigTest;
+
+    var terminal: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &terminal,
+        10,
+        5,
+    ));
+    defer terminal_c.free(terminal);
+    try testing.expectEqual(Result.success, terminal_c.resize(terminal, 10, 5, 10, 10));
+
+    // Transmit a 1x2 RGB image with a 2x1 virtual placement (U=1), then
+    // write two placeholder cells (U+10EEEE) for it at row 1, column 3.
+    const transmit = "\x1b_Ga=T,t=d,f=24,i=1,p=1,s=1,v=2,U=1,c=2,r=1,q=2;////////\x1b\\";
+    terminal_c.vt_write(terminal, transmit.ptr, transmit.len);
+    const cells = "\x1b[2;4H\x1b[38;5;1;58;5;1m\u{10EEEE}\u{10EEEE}";
+    terminal_c.vt_write(terminal, cells.ptr, cells.len);
+
+    var state: RenderState = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &state,
+    ));
+    defer free(state);
+    try testing.expectEqual(Result.success, update(state, terminal));
+
+    var it: ImageIterator = null;
+    try testing.expectEqual(Result.success, image_iterator_new(
+        &lib.alloc.test_allocator,
+        &it,
+    ));
+    defer image_iterator_free(it);
+    try testing.expectEqual(Result.success, get(state, .image_iterator, @ptrCast(&it)));
+    try testing.expect(image_iterator_next(it));
+
+    var protocol: ImageProtocol = undefined;
+    var layer: ImageLayer = undefined;
+    var kind: KittyPlacementKind = .relative;
+    var image_id: u32 = 0;
+    var image_generation: u64 = 0;
+    var placement_id: u32 = 0;
+    var col: i32 = 0;
+    var row_: i32 = 0;
+    var cols: u32 = 0;
+    var rows: u32 = 0;
+    var source_height: u32 = 0;
+    var z: i32 = 0;
+    var written: usize = 0;
+    const keys = [_]ImageData{
+        .protocol,
+        .layer,
+        .kitty_kind,
+        .image_id,
+        .image_generation,
+        .kitty_placement_id,
+        .viewport_col,
+        .viewport_row,
+        .grid_cols,
+        .grid_rows,
+        .source_height,
+        .z,
+    };
+    var values = [_]?*anyopaque{
+        @ptrCast(&protocol),
+        @ptrCast(&layer),
+        @ptrCast(&kind),
+        @ptrCast(&image_id),
+        @ptrCast(&image_generation),
+        @ptrCast(&placement_id),
+        @ptrCast(&col),
+        @ptrCast(&row_),
+        @ptrCast(&cols),
+        @ptrCast(&rows),
+        @ptrCast(&source_height),
+        @ptrCast(&z),
+    };
+    try testing.expectEqual(Result.success, image_get_multi(
+        it,
+        keys.len,
+        &keys,
+        &values,
+        &written,
+    ));
+    try testing.expectEqual(keys.len, written);
+    try testing.expectEqual(ImageProtocol.kitty, protocol);
+    try testing.expectEqual(ImageLayer.below_text, layer);
+    try testing.expectEqual(KittyPlacementKind.virtual, kind);
+    try testing.expectEqual(1, image_id);
+    try testing.expectEqual(1, placement_id);
+    try testing.expectEqual(3, col);
+    try testing.expectEqual(1, row_);
+    try testing.expectEqual(2, cols);
+    try testing.expectEqual(1, rows);
+    try testing.expectEqual(2, source_height);
+    try testing.expectEqual(-1, z);
+
+    // The generation matches the image in the terminal's storage.
+    try testing.expectEqual(
+        terminal.?.terminal.screens.active.kitty_images.imageById(1).?.generation,
+        image_generation,
+    );
+
+    // The 1x2 pixel image is scaled to fit 2x1 cells of 10x10 pixels.
+    // That makes it 5 pixels wide, centered in the 20 pixel width.
+    var width: u32 = 0;
+    var offset_x: u32 = 0;
+    try testing.expectEqual(Result.success, image_get(it, .pixel_width, @ptrCast(&width)));
+    try testing.expectEqual(Result.success, image_get(it, .cell_offset_x, @ptrCast(&offset_x)));
+    try testing.expectEqual(5, width);
+    try testing.expectEqual(8, offset_x);
+
+    try testing.expect(!image_iterator_next(it));
+    try testing.expectEqual(Result.invalid_value, image_get(it, .image_id, @ptrCast(&image_id)));
+}
+
+/// Test helper: a terminal with 10x10 pixel cells that holds a 1x1 RGB
+/// Kitty image with ID 1 and no placements.
+fn testKittyImageTerminal(
+    cols: size.CellCountInt,
+    rows: size.CellCountInt,
+) !terminal_c.Terminal {
+    var terminal: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &terminal,
+        cols,
+        rows,
+    ));
+    errdefer terminal_c.free(terminal);
+    try testing.expectEqual(Result.success, terminal_c.resize(terminal, cols, rows, 10, 10));
+    testVtWrite(terminal, "\x1b_Ga=t,t=d,f=24,i=1,s=1,v=1,q=2;AAAA\x1b\\");
+    return terminal;
+}
+
+/// Test helper: write VT data to a terminal.
+fn testVtWrite(terminal: terminal_c.Terminal, data: []const u8) void {
+    terminal_c.vt_write(terminal, data.ptr, data.len);
+}
+
+test "render: image iterator kitty fixed placement" {
+    if (comptime !@import("terminal_options").kitty_graphics) return error.SkipZigTest;
+
+    const terminal = try testKittyImageTerminal(10, 10);
+    defer terminal_c.free(terminal);
+
+    // Place image 1 at column 2, row 1 with the same values as the Zig
+    // test "fixed: pin placement in viewport".
+    testVtWrite(terminal, "\x1b[2;3H\x1b_Ga=p,i=1,p=7,c=3,r=2,X=4,Y=3,z=-5,C=1,q=2\x1b\\");
+
+    var state: RenderState = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &state,
+    ));
+    defer free(state);
+    try testing.expectEqual(Result.success, update(state, terminal));
+
+    var it: ImageIterator = null;
+    try testing.expectEqual(Result.success, image_iterator_new(
+        &lib.alloc.test_allocator,
+        &it,
+    ));
+    defer image_iterator_free(it);
+    try testing.expectEqual(Result.success, get(state, .image_iterator, @ptrCast(&it)));
+    try testing.expect(image_iterator_next(it));
+
+    var protocol: ImageProtocol = undefined;
+    var layer: ImageLayer = undefined;
+    var kind: KittyPlacementKind = .relative;
+    var image_id: u32 = 0;
+    var image_generation: u64 = 0;
+    var placement_id: u32 = 0;
+    var col: i32 = 0;
+    var row_: i32 = 0;
+    var cols: u32 = 0;
+    var rows: u32 = 0;
+    var offset_x: u32 = 0;
+    var offset_y: u32 = 0;
+    var width: u32 = 0;
+    var height: u32 = 0;
+    var source_x: u32 = 0;
+    var source_y: u32 = 0;
+    var source_width: u32 = 0;
+    var source_height: u32 = 0;
+    var z: i32 = 0;
+    var written: usize = 0;
+    const keys = [_]ImageData{
+        .protocol,
+        .layer,
+        .kitty_kind,
+        .image_id,
+        .image_generation,
+        .kitty_placement_id,
+        .viewport_col,
+        .viewport_row,
+        .grid_cols,
+        .grid_rows,
+        .cell_offset_x,
+        .cell_offset_y,
+        .pixel_width,
+        .pixel_height,
+        .source_x,
+        .source_y,
+        .source_width,
+        .source_height,
+        .z,
+    };
+    var values = [_]?*anyopaque{
+        @ptrCast(&protocol),
+        @ptrCast(&layer),
+        @ptrCast(&kind),
+        @ptrCast(&image_id),
+        @ptrCast(&image_generation),
+        @ptrCast(&placement_id),
+        @ptrCast(&col),
+        @ptrCast(&row_),
+        @ptrCast(&cols),
+        @ptrCast(&rows),
+        @ptrCast(&offset_x),
+        @ptrCast(&offset_y),
+        @ptrCast(&width),
+        @ptrCast(&height),
+        @ptrCast(&source_x),
+        @ptrCast(&source_y),
+        @ptrCast(&source_width),
+        @ptrCast(&source_height),
+        @ptrCast(&z),
+    };
+    try testing.expectEqual(Result.success, image_get_multi(
+        it,
+        keys.len,
+        &keys,
+        &values,
+        &written,
+    ));
+    try testing.expectEqual(keys.len, written);
+
+    const t = terminal.?.terminal;
+    const storage = &t.screens.active.kitty_images;
+    const image = storage.imageById(1).?;
+    const sp = storage.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 7 },
+    }).?;
+    const dest = sp.pixelSize(image, t);
+    const source = sp.sourceRect(image);
+    try testing.expectEqual(ImageProtocol.kitty, protocol);
+    try testing.expectEqual(ImageLayer.below_text, layer);
+    try testing.expectEqual(KittyPlacementKind.fixed, kind);
+    try testing.expectEqual(1, image_id);
+    try testing.expectEqual(image.generation, image_generation);
+    try testing.expectEqual(7, placement_id);
+    try testing.expectEqual(2, col);
+    try testing.expectEqual(1, row_);
+    try testing.expectEqual(3, cols);
+    try testing.expectEqual(2, rows);
+    try testing.expectEqual(4, offset_x);
+    try testing.expectEqual(3, offset_y);
+    try testing.expectEqual(dest.width, width);
+    try testing.expectEqual(dest.height, height);
+    try testing.expectEqual(source.x, source_x);
+    try testing.expectEqual(source.y, source_y);
+    try testing.expectEqual(source.width, source_width);
+    try testing.expectEqual(source.height, source_height);
+    try testing.expectEqual(-5, z);
+    try testing.expect(!image_iterator_next(it));
+
+    // A placement the program gave no ID gets an internal one, which is
+    // reported as 0.
+    testVtWrite(terminal, "\x1b[6;1H\x1b_Ga=p,i=1,C=1,q=2\x1b\\");
+    try testing.expectEqual(Result.success, update(state, terminal));
+    try testing.expectEqual(Result.success, get(state, .image_iterator, @ptrCast(&it)));
+    var found_internal = false;
+    var count: usize = 0;
+    while (image_iterator_next(it)) : (count += 1) {
+        try testing.expectEqual(Result.success, image_get(it, .kitty_placement_id, @ptrCast(&placement_id)));
+        try testing.expectEqual(Result.success, image_get(it, .viewport_row, @ptrCast(&row_)));
+        if (row_ == 5) {
+            try testing.expectEqual(0, placement_id);
+            found_internal = true;
+        } else {
+            try testing.expectEqual(7, placement_id);
+        }
+    }
+    try testing.expectEqual(2, count);
+    try testing.expect(found_internal);
+}
+
+test "render: image iterator fixed placement above the viewport" {
+    if (comptime !@import("terminal_options").kitty_graphics) return error.SkipZigTest;
+
+    const terminal = try testKittyImageTerminal(10, 5);
+    defer terminal_c.free(terminal);
+
+    // A placement 2 columns by 3 rows on the top row, then two lines of
+    // output so that it starts 2 rows above the viewport.
+    testVtWrite(terminal, "\x1b[1;2H\x1b_Ga=p,i=1,p=1,c=2,r=3,C=1,q=2\x1b\\");
+    testVtWrite(terminal, "\x1b[5;1H\n\n");
+
+    var state: RenderState = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &state,
+    ));
+    defer free(state);
+    const req: Overscan = .{ .above = 1 };
+    try testing.expectEqual(Result.success, set(state, .overscan, @ptrCast(&req)));
+    try testing.expectEqual(Result.success, update(state, terminal));
+
+    var out: Overscan = .{};
+    try testing.expectEqual(Result.success, get(state, .overscan, @ptrCast(&out)));
+    try testing.expectEqual(1, out.above);
+
+    var it: ImageIterator = null;
+    try testing.expectEqual(Result.success, image_iterator_new(
+        &lib.alloc.test_allocator,
+        &it,
+    ));
+    defer image_iterator_free(it);
+    try testing.expectEqual(Result.success, get(state, .image_iterator, @ptrCast(&it)));
+    try testing.expect(image_iterator_next(it));
+
+    // Its top row is above the one overscan row, and it is still reported
+    // at its full size.
+    var col: i32 = 0;
+    var row_: i32 = 0;
+    var cols: u32 = 0;
+    var rows: u32 = 0;
+    var width: u32 = 0;
+    var height: u32 = 0;
+    try testing.expectEqual(Result.success, image_get(it, .viewport_col, @ptrCast(&col)));
+    try testing.expectEqual(Result.success, image_get(it, .viewport_row, @ptrCast(&row_)));
+    try testing.expectEqual(Result.success, image_get(it, .grid_cols, @ptrCast(&cols)));
+    try testing.expectEqual(Result.success, image_get(it, .grid_rows, @ptrCast(&rows)));
+    try testing.expectEqual(Result.success, image_get(it, .pixel_width, @ptrCast(&width)));
+    try testing.expectEqual(Result.success, image_get(it, .pixel_height, @ptrCast(&height)));
+    try testing.expectEqual(1, col);
+    try testing.expectEqual(-2, row_);
+    try testing.expectEqual(2, cols);
+    try testing.expectEqual(3, rows);
+    try testing.expectEqual(20, width);
+    try testing.expectEqual(30, height);
+    try testing.expect(!image_iterator_next(it));
+}
+
+test "render: image placements generation" {
+    const terminal = try testKittyImageTerminal(10, 5);
+    defer terminal_c.free(terminal);
+
+    var state: RenderState = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &state,
+    ));
+    defer free(state);
+    try testing.expectEqual(Result.success, update(state, terminal));
+
+    var generation: u64 = 0;
+    try testing.expectEqual(Result.success, get(state, .image_placements_generation, @ptrCast(&generation)));
+    if (comptime !@import("terminal_options").kitty_graphics) {
+        try testing.expectEqual(0, generation);
+        return;
+    }
+
+    var current: u64 = 0;
+
+    // A quiet update leaves it alone.
+    try testing.expectEqual(Result.success, update(state, terminal));
+    try testing.expectEqual(Result.success, get(state, .image_placements_generation, @ptrCast(&current)));
+    try testing.expectEqual(generation, current);
+
+    // Adding a placement changes it.
+    testVtWrite(terminal, "\x1b[1;1H\x1b_Ga=p,i=1,p=1,c=2,r=2,C=1,q=2\x1b\\");
+    try testing.expectEqual(Result.success, update(state, terminal));
+    try testing.expectEqual(Result.success, get(state, .image_placements_generation, @ptrCast(&current)));
+    try testing.expect(generation != current);
+    generation = current;
+
+    // Dirtying a row without images leaves it alone.
+    testVtWrite(terminal, "\x1b[4;1Hhello");
+    try testing.expectEqual(Result.success, update(state, terminal));
+    try testing.expectEqual(Result.success, get(state, .image_placements_generation, @ptrCast(&current)));
+    try testing.expectEqual(generation, current);
+
+    // Scrolling the screen moves the fixed placement, which changes it.
+    testVtWrite(terminal, "\x1b[5;1H\n");
+    try testing.expectEqual(Result.success, update(state, terminal));
+    try testing.expectEqual(Result.success, get(state, .image_placements_generation, @ptrCast(&current)));
+    try testing.expect(generation != current);
 }

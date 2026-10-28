@@ -4,6 +4,50 @@ Ghosttal tracks [Ghostty](https://github.com/ghostty-org/ghostty) manually.
 Upstream code reaches Ghosttal users only after it is merged, reviewed against
 the fork's patch set, tested, and released through Ghosttal's own Sparkle feed.
 
+## Current integration
+
+Ghosttal 0.1.7 integrates the signed Ghostty `v1.4.0` tag (commit
+`83fb95624b0439ee660c2679b43b38c8b63769cd`) and the following post-tag fixes:
+
+- `46e9dc9a927b2e7e7cba79e6902c176127dbdf2c` (#14879): reject truncated
+  UTF-8 configuration strings instead of panicking.
+- `b840b2457cc0f5ee63cb324b3af9bb8e753e512c` (#14876): validate hexadecimal
+  letters correctly in Unicode argument escapes.
+
+The build toolchain is Zig 0.17.0. Sparkle remains pinned to 2.9.6. Ghosttal's
+own release workflows, identity, configuration layering, motion controls, and
+Sparkle feed are retained. Upstream release and repository-maintenance workflows
+are intentionally excluded from this integration. The standalone FreeBSD VM
+test helpers are retained.
+
+### Validation for 0.1.7
+
+Validated locally on macOS 27.2 with Xcode 27.1 and Zig 0.17.0:
+
+- Complete native Metal/core suite: 4,136 passed, 26 skipped.
+- Complete libghostty-vt Zig and C API suites: 6,961 passed, 56 skipped.
+- macOS unit suite: 288 passed, one disabled benchmark skipped.
+- Focused Metal/fork/parser regressions: 174 passed, three skipped.
+- Focused OpenGL regressions: 129 passed.
+- ReleaseFast terminal/paste/layout regressions: 209 passed.
+- Shipped Bash and Zsh hook regressions: nine passed.
+- Native C ABI schema verification and ReleaseSmall WebAssembly build passed.
+- SwiftLint strict validation passed across 197 files; tracked Zig formatting,
+  shell syntax, workflow YAML, and app version/plist checks passed.
+- Universal ReleaseFast/macOS Release preflight passed for both the app and
+  DockTilePlugin, with arm64 and x86_64 slices.
+
+Direct app checks passed for startup, typing and Unicode paste/rendering,
+forward/backward search, tabs, typed-glyph retention across tab focus changes,
+split creation/resizing, command-palette filtering, configuration reload, and
+About version/build 0.1.7. The Debug app was closed afterwards.
+
+Automated UI coverage is incomplete: the existing mouse command-palette test
+attempted to click an offscreen item, and the suite stalled while setting system
+appearance. That run was stopped and was not restarted. Display sleep/wake,
+physical monitor hotplug, and runtime testing on older macOS versions remain
+manual checks for a maintainer with the corresponding environment.
+
 ## Remotes and upstream sync
 
 - `origin` — `git@github.com:ccyisafool/ghosttal.git` (push target)
@@ -31,7 +75,7 @@ After every sync, run:
 
 ```sh
 zig fmt --check .
-zig build test
+zig build test -Demit-macos-app=false -Demit-xcframework=false
 zig build -Demit-macos-app=false
 ./macos/build.nu --scheme Ghostty --configuration Debug --action test
 ./scripts/release-preflight.sh
@@ -71,7 +115,7 @@ The helper never deletes the certificate file supplied by the maintainer.
 
 ## Local release
 
-Install Zig 0.16.0, Nushell 0.115.1, Xcode 26, Sparkle 2.9.6 tools, and
+Install Zig 0.17.0, Nushell 0.115.1, Xcode 26, Sparkle 2.9.6 tools, and
 `create-dmg`. Prepare and check out the clean tagged commit, then run:
 
 ```sh

@@ -20,10 +20,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Zig 0.16.0
+      - name: Install Zig 0.17.0
         run: |
-          curl -fsSL -o zig.tar.xz https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz
-          echo "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489  zig.tar.xz" | shasum -a 256 -c -
+          curl -fsSL -o zig.tar.xz https://ziglang.org/download/0.17.0/zig-aarch64-macos-0.17.0.tar.xz
+          echo "b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a  zig.tar.xz" | shasum -a 256 -c -
           mkdir -p "${RUNNER_TEMP}/zig"
           tar -xJf zig.tar.xz -C "${RUNNER_TEMP}/zig" --strip-components 1
           echo "${RUNNER_TEMP}/zig" >> "${GITHUB_PATH}"
@@ -54,9 +54,12 @@ jobs:
         run: swiftlint lint --strict
 
       - name: Zig tests
-        run: zig build test
+        run: zig build test -Demit-macos-app=false -Demit-xcframework=false
 
-      - name: Bash integration tests
+      - name: libghostty-vt tests
+        run: zig build test-lib-vt
+
+      - name: Shell integration tests
         run: python3 scripts/test-bash-integration.py
 
       - name: Shared-core build

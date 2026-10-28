@@ -405,7 +405,6 @@ extension Ghostty {
                 surface: surfaceView,
                 contents: display,
                 kind: kind,
-                programName: c.name.map { String(cString: $0) },
                 canRemember: c.can_remember,
                 previewImage: previewImage
             ) { surfaceView, confirmed, remember in
@@ -621,6 +620,9 @@ extension Ghostty {
             case GHOSTTY_ACTION_MOVE_TAB:
                 return moveTab(app, target: target, move: action.action.move_tab)
 
+            case GHOSTTY_ACTION_MOVE_TAB_TO_NEW_WINDOW:
+                return moveTabToNewWindow(app, target: target)
+
             case GHOSTTY_ACTION_GOTO_TAB:
                 return gotoTab(app, target: target, tab: action.action.goto_tab)
 
@@ -686,6 +688,9 @@ extension Ghostty {
 
             case GHOSTTY_ACTION_RESET_WINDOW_SIZE:
                 resetWindowSize(app, target: target)
+
+            case GHOSTTY_ACTION_RESIZE_WINDOW:
+                return resizeWindow(app, target: target, v: action.action.resize_window)
 
             case GHOSTTY_ACTION_CELL_SIZE:
                 setCellSize(app, target: target, v: action.action.cell_size)
@@ -826,6 +831,18 @@ extension Ghostty {
                 url = URL(filePath: expandedPath)
             }
 
+            // Unknown URLs are as untrusted as OSC 8 but may be plain paths,
+            // which UntrustedURL rejects, so check the file URL built above.
+            // Values with unsafe characters are passed unchanged so they are
+            // rejected before percent-encoding hides them.
+            if action.kind == .unknown {
+                let hasScheme = URL(string: action.url)?.scheme != nil
+                let target = hasScheme || UntrustedURL.containsUnsafeCharacters(action.url)
+                    ? action.url
+                    : url.absoluteString
+                return openUntrustedURL(target)
+            }
+
             switch action.kind {
             case .text:
                 // Open with the default editor for `*.ghostty` file or just system text editor
@@ -839,11 +856,8 @@ extension Ghostty {
                 // The extension will be HTML and we do the right thing automatically.
                 break
 
-            case .unknown:
-                break
-
-            case .osc8:
-                assertionFailure("OSC 8 URLs must use the safe-opening policy")
+            case .osc8, .unknown:
+                assertionFailure("Untrusted URLs must use the safe-opening policy")
                 return true
             }
 
@@ -1270,6 +1284,31 @@ extension Ghostty {
                             SwiftUI.Notification.Name.GhosttyMoveTabKey: Action.MoveTab(c: move),
                         ]
                     )
+
+                default:
+                    assertionFailure()
+                }
+
+                return true
+        }
+
+        private static func moveTabToNewWindow(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s) -> Bool {
+                switch target.tag {
+                case GHOSTTY_TARGET_APP:
+                    Ghostty.logger.warning("move tab to new window does nothing with an app target")
+                    return false
+
+                case GHOSTTY_TARGET_SURFACE:
+                    guard let surface = target.target.surface else { return false }
+                    guard let surfaceView = self.surfaceView(from: surface) else { return false }
+
+                    // See gotoTab for notes on this check. A lone tab is already
+                    // a window of its own, so there is nothing to move.
+                    guard (surfaceView.window?.tabGroup?.windows.count ?? 0) > 1 else { return false }
+
+                    surfaceView.window?.moveTabToNewWindow(nil)
 
                 default:
                     assertionFailure()
@@ -2040,6 +2079,30 @@ extension Ghostty {
 
             default:
                 assertionFailure()
+            }
+        }
+
+        private static func resizeWindow(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            v: ghostty_action_resize_window_s) -> Bool {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                Ghostty.logger.warning("resize window does nothing with an app target")
+                return false
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return false }
+                guard let surfaceView = self.surfaceView(from: surface) else { return false }
+                guard let controller = surfaceView.window?.windowController as? TerminalController else { return false }
+                return controller.resizeWindow(
+                    surfaceView,
+                    to: NSSize(width: Double(v.width), height: Double(v.height))
+                )
+
+            default:
+                assertionFailure()
+                return false
             }
         }
 

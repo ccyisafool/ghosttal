@@ -63,6 +63,21 @@ Ghosttal intentionally reads Ghostty's configuration first for compatibility, bu
 its own overlay, crash reports, update state, and application data under Ghosttal-specific
 paths. Removing Ghosttal does not remove or rewrite stock Ghostty's configuration.
 
+## Upgrading to 0.1.7
+
+Ghosttal 0.1.7 incorporates Ghostty 1.4.0. Existing Ghosttal motion settings and
+Ghostty-base/Ghosttal-overlay precedence continue to work. Upstream behavior
+changes also apply:
+
+- On macOS, `copy-on-select` now defaults to `none`. Set it to `primary` to retain
+  the previous selection-copy and middle-click behavior.
+- `copy-on-select = clipboard` now copies only to the system clipboard; use
+  `both` if you want both clipboards. The old `true` spelling now maps to
+  `clipboard` on macOS, so use an explicit value when migrating.
+- Cmd-Up/Down now jump between shell prompts. To retain scrolling to the start
+  and end, configure `keybind = cmd+arrow_up=scroll_to_top` and
+  `keybind = cmd+arrow_down=scroll_to_bottom`.
+
 ## Updates
 
 Use **Ghosttal → Check for Updates…**, or let the automatic background checks run
@@ -76,7 +91,7 @@ changes reach users only after they are merged, tested, and released here — se
 
 ## Building
 
-Install Zig 0.16.0, Nushell, and Xcode 26 or later, then build the shared core and
+Install Zig 0.17.0, Nushell, and Xcode 26 or later, then build the shared core and
 macOS app:
 
 ```sh

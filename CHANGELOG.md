@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.7
+
+- Sync the terminal core and macOS app with Ghostty 1.4.0, preserving Ghosttal's
+  cursor/input motion, configuration overlay precedence, and independent updates.
+- Include upstream security fixes for unsafe paste and drag-and-drop, shell
+  directory reporting, terminal graphics, tmux layouts, and scrollback handling.
+- Adopt upstream display-link lifecycle and GPU resource improvements while
+  preserving focus-aware motion and rendering image-only updates correctly.
+- Include post-1.4.0 fixes for truncated UTF-8 configuration values and Unicode
+  escape validation in command arguments.
+- Update the build and release pipelines to pinned Zig 0.17.0 and run the
+  libghostty-vt and shell integration regression suites during verification.
+- Adopt upstream selection-copy settings and Cmd-Up/Down prompt navigation.
+  See the configuration migration notes in the README before upgrading.
+
 ## 0.1.6
 
 - Update and exactly pin Sparkle to 2.9.6, including the release signing tools,

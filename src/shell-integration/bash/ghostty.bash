@@ -193,7 +193,12 @@ function __ghostty_precmd() {
   # command like cd /test && cat. PS0 is evaluated before cd is run.
   if [[ "$_ghostty_last_reported_cwd" != "$PWD" ]]; then
     _ghostty_last_reported_cwd="$PWD"
-    builtin printf "\e]7;kitty-shell-cwd://%s%s\a" "$HOSTNAME" "$PWD"
+    # Remove control bytes from the hostname and directory before sending
+    # them. A directory name that contains a raw ESC or BEL byte could
+    # otherwise end our OSC 7 early and start a sequence of its own, such
+    # as an OSC 52 clipboard write. Backslashes are safe here because
+    # printf only expands escapes in the format string, not in %s values.
+    builtin printf "\e]7;kitty-shell-cwd://%s%s\a" "${HOSTNAME//[[:cntrl:]]/}" "${PWD//[[:cntrl:]]/}"
   fi
 
   _ghostty_executing=0
@@ -256,7 +261,7 @@ if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )
   # errors from inside our hooks, but those are all terminal escape sequences
   # and non-actionable.
   # shellcheck disable=SC2128,SC2178,SC2179
-  if [[ ";${PROMPT_COMMAND[*]:-};" != *";__ghostty_hook 2>/dev/null;"* ]]; then
+  if [[ "${PROMPT_COMMAND[*]:-}" != *"__ghostty_hook 2>/dev/null"* ]]; then
     if [[ -z "${PROMPT_COMMAND[*]}" ]]; then
       if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); then
         PROMPT_COMMAND=("__ghostty_hook 2>/dev/null")
